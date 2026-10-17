@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -180,6 +181,16 @@ func loadConfig() (*Config, string, error) {
 			s.Group = "Default"
 		}
 	}
+
+	// 需求1：按服务器名称以 A-z 自然字母序排序 (忽略大小写)
+	sort.SliceStable(cfg.Servers, func(i, j int) bool {
+		nameI := strings.ToLower(cfg.Servers[i].Name)
+		nameJ := strings.ToLower(cfg.Servers[j].Name)
+		if nameI == nameJ {
+			return cfg.Servers[i].Name < cfg.Servers[j].Name
+		}
+		return nameI < nameJ
+	})
 
 	return &cfg, cfgPath, nil
 }
@@ -478,6 +489,16 @@ func connectToServer(s *ServerConfig, cfg *Config) error {
 
 	// 重置终端所有颜色和光标状态，防止上一帧控制字符残留
 	fmt.Print("\033[0m\033[?25h")
+
+	// 需求2：在 Ghostty 标签页最上方显示当前连接的服务器备注
+	tabTitle := s.Name
+	if s.Group != "" && s.Group != "Default" {
+		tabTitle = fmt.Sprintf("[%s] %s (%s)", s.Group, s.Name, s.Host)
+	} else {
+		tabTitle = fmt.Sprintf("%s (%s)", s.Name, s.Host)
+	}
+	// 发送 OSC 0 控制序列，实时设置 Ghostty 窗口与标签页标题
+	fmt.Printf("\033]0;%s\007", tabTitle)
 	_ = os.Stdout.Sync()
 
 	// 解决 Ghostty 核心乱码问题：
