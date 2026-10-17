@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -479,6 +480,68 @@ func (m model) View() string {
 	return b.String()
 }
 
+// 渲染高颜值过渡进度条 (填补 SSH 握手前 1~2 秒的黑屏空虚感)
+func showConnectingProgress(s *ServerConfig) {
+	primaryColor := "\033[38;2;56;189;248m"  // 亮天青 #38bdf8
+	successColor := "\033[38;2;52;211;153m"  // 翡翠绿 #34d399
+	accentColor  := "\033[38;2;168;85;247m"  // 紫色 #a855f7
+	dimColor     := "\033[38;2;100;116;139m" // 中性灰 #64748b
+	bold         := "\033[1m"
+	reset        := "\033[0m"
+
+	authBadge := "🔑 密钥"
+	if s.Auth == "password" {
+		authBadge = "🔒 密码"
+	}
+
+	fmt.Printf("\n %s🚀%s 正在连接 %s[%s]%s %s%s%s (%s@%s:%d) [%s]\n",
+		bold, reset,
+		accentColor, s.Group, reset,
+		bold+primaryColor, s.Name, reset,
+		s.User, s.Host, s.Port, authBadge,
+	)
+
+	steps := []struct {
+		percent int
+		text    string
+		frame   string
+		delay   time.Duration
+	}{
+		{20, "正在初始化加密会话与环境变量...", "⠋", 70 * time.Millisecond},
+		{50, "正在校验安全认证凭据...", "⠙", 80 * time.Millisecond},
+		{80, "正在建立安全通信信道...", "⠹", 80 * time.Millisecond},
+		{100, "信道就绪，移交交互终端！", "✓", 70 * time.Millisecond},
+	}
+
+	barWidth := 26
+	for _, step := range steps {
+		filled := int(float64(barWidth) * float64(step.percent) / 100.0)
+		empty := barWidth - filled
+		if empty < 0 {
+			empty = 0
+		}
+
+		color := primaryColor
+		if step.percent == 100 {
+			color = successColor
+		}
+
+		bar := strings.Repeat("━", filled) + strings.Repeat("╌", empty)
+
+		fmt.Printf("\r %s%s%s %s[%s]%s %3d%% %s%s%s",
+			color, step.frame, reset,
+			color, bar, reset,
+			step.percent,
+			dimColor, step.text, reset,
+		)
+		_ = os.Stdout.Sync()
+		time.Sleep(step.delay)
+	}
+
+	fmt.Printf("\n\n")
+	_ = os.Stdout.Sync()
+}
+
 // 执行连接
 func connectToServer(s *ServerConfig, cfg *Config) error {
 	sshPath, err := exec.LookPath("ssh")
@@ -492,14 +555,8 @@ func connectToServer(s *ServerConfig, cfg *Config) error {
 	// 重置终端状态
 	fmt.Print("\033[0m\033[?25h")
 
-	// 打印即时连接反馈，避免纯黑屏等待
-	connBadge := "🔑 密钥"
-	if s.Auth == "password" {
-		connBadge = "🔒 密码"
-	}
-	fmt.Printf("\n🚀 正在连接 [%s] %s (%s@%s:%d) [%s]...\n\n",
-		s.Group, s.Name, s.User, s.Host, s.Port, connBadge)
-	_ = os.Stdout.Sync()
+	// 播放高颜值过渡进度条
+	showConnectingProgress(s)
 
 	env := os.Environ()
 	newEnv := make([]string, 0, len(env)+2)
@@ -796,7 +853,46 @@ func main() {
 
 	initialFilter := ""
 	if flag.NArg() > 0 {
-		initialFilter = flag.Arg(0)
+		searchTerm := strings.TrimSpace(flag.Arg(0))
+		if searchTerm != "" {
+			// 1. 优先完全精准匹配 (不区分大小写)
+			var exactMatches []ServerConfig
+			for _, s := range cfg.Servers {
+				if strings.EqualFold(s.Name, searchTerm) {
+					exactMatches = append(exactMatches, s)
+				}
+			}
+			if len(exactMatches) == 1 {
+				// 唯一精准匹配：直接直连，无需弹 TUI
+				target := exactMatches[0]
+				if err := connectToServer(&target, cfg); err != nil {
+					fmt.Fprintf(os.Stderr, "连接失败: %v\n", err)
+					os.Exit(1)
+				}
+				return
+			}
+
+			// 2. 模糊包含匹配 (按 Name 包含关键词)
+			lowerSearch := strings.ToLower(searchTerm)
+			var partialMatches []ServerConfig
+			for _, s := range cfg.Servers {
+				if strings.Contains(strings.ToLower(s.Name), lowerSearch) {
+					partialMatches = append(partialMatches, s)
+				}
+			}
+			if len(partialMatches) == 1 {
+				// 唯一模糊匹配：直接直连，无需弹 TUI
+				target := partialMatches[0]
+				if err := connectToServer(&target, cfg); err != nil {
+					fmt.Fprintf(os.Stderr, "连接失败: %v\n", err)
+					os.Exit(1)
+				}
+				return
+			}
+
+			// 匹配到多台机器 (如 s oracle 匹配多台) 则携带搜索词唤起 TUI 供选择
+			initialFilter = searchTerm
+		}
 	}
 
 	p := tea.NewProgram(initialModel(cfg, cfgPath, initialFilter), tea.WithAltScreen())
