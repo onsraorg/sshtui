@@ -36,6 +36,8 @@
 | **`s -e`** | **快速打开配置文件**（调用默认编辑器 `$EDITOR` 或 vim 编辑 `servers.yaml`） |
 | `s -l` | 纯文本表格快速打印所有已配置的服务器列表（无 TTY 环境也可用） |
 | `s -p` | 打印当前使用的配置文件绝对路径 |
+| **`s --ansible`** | **输出 Ansible Dynamic Inventory JSON**（可直接供 Ansible 作为动态清单） |
+| `s --ansible-ini` | 输出 Ansible 标准 INI 清单格式（支持重定向保存为 `hosts.ini`） |
 
 ---
 
@@ -87,6 +89,38 @@ servers:
     group: "Dev"
     host: "47.242.100.20"
 ```
+
+---
+
+## 🤖 与 Ansible 自动化运维无缝联动
+
+`sshtui` 原生支持将 `servers.yaml` 导出为符合 **Ansible Dynamic Inventory 官方规范** 的资产清单，**一份配置，两处复用**：
+
+### 1. 动态清单直接运行（无需生成任何中间文件）
+```bash
+# 查看所有 12 台机器的磁盘剩余空间 (使用进程替换)
+ansible all -i <(s --ansible) -m shell -a "df -h"
+
+# 或者直接让 Ansible 将 s 命令识别为动态清单脚本
+ansible all -i $(which s) -m ping
+
+# 只对特定分组 (例如 Prod) 执行命令
+ansible Prod -i <(s --ansible) -m shell -a "uptime"
+```
+
+### 2. 导出为静态 INI 主机清单
+```bash
+# 导出一份干净的 hosts.ini
+s --ansible-ini > hosts.ini
+
+# 运行 playbook
+ansible-playbook -i hosts.ini my_playbook.yml
+```
+
+> **参数自动映射说明**：
+> - 密钥登录自动映射为 `ansible_ssh_private_key_file`
+> - 密码登录自动映射为 `ansible_password` & `ansible_ssh_pass`
+> - 自动注入 `-o StrictHostKeyChecking=accept-new` 与心跳保活参数，批量执行不会因主机确认或超时挂死。
 
 ---
 

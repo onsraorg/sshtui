@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -561,10 +562,116 @@ interact
 	return syscall.Exec(sshPath, args, newEnv)
 }
 
+// 生成 Ansible Dynamic Inventory 标准 JSON
+func generateAnsibleJSON(cfg *Config) ([]byte, error) {
+	type HostVars map[string]interface{}
+
+	meta := map[string]interface{}{
+		"hostvars": make(map[string]HostVars),
+	}
+
+	groups := make(map[string][]string)
+	allChildren := make(map[string]bool)
+
+	// 通用 SSH 参数：严格保活防断开、禁用未知主机交互提示
+	commonArgs := fmt.Sprintf("-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=%d -o ServerAliveCountMax=%d -o TCPKeepAlive=yes",
+		cfg.Default.ServerAliveInterval, cfg.Default.ServerAliveCountMax)
+
+	for _, s := range cfg.Servers {
+		hostName := strings.TrimSpace(s.Name)
+		if hostName == "" {
+			hostName = s.Host
+		}
+
+		groupName := strings.TrimSpace(s.Group)
+		if groupName == "" {
+			groupName = "ungrouped"
+		}
+
+		groups[groupName] = append(groups[groupName], hostName)
+		allChildren[groupName] = true
+
+		vars := HostVars{
+			"ansible_host":            s.Host,
+			"ansible_port":            s.Port,
+			"ansible_user":            s.User,
+			"ansible_ssh_common_args": commonArgs,
+		}
+
+		if s.Auth == "password" && s.Password != "" {
+			vars["ansible_password"] = s.Password
+			vars["ansible_ssh_pass"] = s.Password
+		} else if s.Key != "" {
+			vars["ansible_ssh_private_key_file"] = expandPath(s.Key)
+		}
+
+		meta["hostvars"].(map[string]HostVars)[hostName] = vars
+	}
+
+	result := make(map[string]interface{})
+	result["_meta"] = meta
+
+	var childrenList []string
+	for g, hosts := range groups {
+		result[g] = map[string]interface{}{
+			"hosts": hosts,
+		}
+		childrenList = append(childrenList, g)
+	}
+
+	result["all"] = map[string]interface{}{
+		"children": childrenList,
+	}
+
+	return json.MarshalIndent(result, "", "  ")
+}
+
+// 生成 Ansible INI 格式清单
+func generateAnsibleINI(cfg *Config) string {
+	var b strings.Builder
+	commonArgs := fmt.Sprintf("-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=%d -o ServerAliveCountMax=%d -o TCPKeepAlive=yes",
+		cfg.Default.ServerAliveInterval, cfg.Default.ServerAliveCountMax)
+
+	groups := make(map[string][]ServerConfig)
+	for _, s := range cfg.Servers {
+		g := strings.TrimSpace(s.Group)
+		if g == "" {
+			g = "ungrouped"
+		}
+		groups[g] = append(groups[g], s)
+	}
+
+	for g, list := range groups {
+		b.WriteString(fmt.Sprintf("[%s]\n", g))
+		for _, s := range list {
+			hostName := strings.TrimSpace(s.Name)
+			if hostName == "" {
+				hostName = s.Host
+			}
+			line := fmt.Sprintf("%-20s ansible_host=%s ansible_port=%d ansible_user=%s",
+				hostName, s.Host, s.Port, s.User)
+			if s.Auth == "password" && s.Password != "" {
+				line += fmt.Sprintf(" ansible_password=\"%s\" ansible_ssh_pass=\"%s\"", s.Password, s.Password)
+			} else if s.Key != "" {
+				line += fmt.Sprintf(" ansible_ssh_private_key_file=\"%s\"", expandPath(s.Key))
+			}
+			line += fmt.Sprintf(" ansible_ssh_common_args=\"%s\"\n", commonArgs)
+			b.WriteString(line)
+		}
+		b.WriteString("\n")
+	}
+
+	return b.String()
+}
+
 func main() {
 	editFlag := flag.Bool("e", false, "用系统编辑器直接打开配置文件编辑")
-	listFlag := flag.Bool("l", false, "纯文本列出所有配置的服务器")
+	listTableFlag := flag.Bool("l", false, "纯文本表格列出所有配置的服务器")
 	pathFlag := flag.Bool("p", false, "打印配置文件所在绝对路径")
+	ansibleFlag := flag.Bool("ansible", false, "输出 Ansible Dynamic Inventory JSON 格式")
+	ansibleIniFlag := flag.Bool("ansible-ini", false, "输出 Ansible INI 格式")
+	ansibleListHook := flag.Bool("list", false, "Ansible 官方动态清单规范 Hook (等同于 --ansible)")
+	ansibleHostHook := flag.String("host", "", "Ansible 官方单机查询 Hook")
 	flag.Parse()
 
 	cfg, cfgPath, err := loadConfig()
@@ -594,7 +701,28 @@ func main() {
 		return
 	}
 
-	if *listFlag {
+	if *ansibleFlag || *ansibleListHook {
+		jsonBytes, err := generateAnsibleJSON(cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "生成 Ansible Inventory 失败: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(jsonBytes))
+		return
+	}
+
+	if *ansibleHostHook != "" {
+		// Ansible 规范要求单机 host 查询返回 JSON 字典，变量已合并在 _meta 中
+		fmt.Println("{}")
+		return
+	}
+
+	if *ansibleIniFlag {
+		fmt.Print(generateAnsibleINI(cfg))
+		return
+	}
+
+	if *listTableFlag {
 		fmt.Printf("配置文件: %s (共 %d 台)\n\n", cfgPath, len(cfg.Servers))
 		for i, s := range cfg.Servers {
 			authStr := "🔑 密钥"
