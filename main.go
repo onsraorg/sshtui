@@ -1,50 +1,56 @@
 package main
 
 import (
+	"cmp"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"maps"
+	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
+	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
 
-// ServerConfig 定义单台服务器配置
+// ServerConfig describes one SSH target.
 type ServerConfig struct {
 	Name     string   `yaml:"name"`
 	Group    string   `yaml:"group"`
 	Host     string   `yaml:"host"`
 	Port     int      `yaml:"port"`
 	User     string   `yaml:"user"`
-	Auth     string   `yaml:"auth"` // "key" 或 "password"
+	Auth     string   `yaml:"auth"` // "key" or "password"
 	Key      string   `yaml:"key"`
 	Password string   `yaml:"password"`
-	Args     []string `yaml:"args"` // 额外 ssh 参数
+	Args     []string `yaml:"args"` // Additional SSH arguments.
 }
 
-// Config 全局配置结构
+// Config holds defaults and SSH targets.
 type Config struct {
 	Default struct {
 		User                string `yaml:"user"`
 		Port                int    `yaml:"port"`
 		Key                 string `yaml:"key"`
-		ServerAliveInterval int    `yaml:"server_alive_interval"` // 心跳间隔秒数，默认 30
-		ServerAliveCountMax int    `yaml:"server_alive_count_max"` // 探测失败重试次数，默认 3
+		ServerAliveInterval int    `yaml:"server_alive_interval"`  // Keepalive interval in seconds; defaults to 30.
+		ServerAliveCountMax int    `yaml:"server_alive_count_max"` // Failed keepalive limit; defaults to 3.
 	} `yaml:"default"`
 	Servers []ServerConfig `yaml:"servers"`
 }
 
-// 展开波浪号 ~ 为用户家目录
 func expandPath(path string) string {
 	if strings.HasPrefix(path, "~/") {
 		home, err := os.UserHomeDir()
@@ -55,27 +61,26 @@ func expandPath(path string) string {
 	return path
 }
 
-// 获取配置文件路径
 func getConfigPath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
 
-	p1 := filepath.Join(home, ".config", "sshtui", "servers.yaml")
-	if _, err := os.Stat(p1); err == nil {
-		return p1, nil
+	paths := []string{
+		filepath.Join(home, ".config", "sshtui", "servers.yaml"),
+		filepath.Join(home, ".ssh", "servers.yaml"),
 	}
-
-	p2 := filepath.Join(home, ".ssh", "servers.yaml")
-	if _, err := os.Stat(p2); err == nil {
-		return p2, nil
+	for _, path := range paths {
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
 	}
-
-	return p1, nil
+	return paths[0], nil
 }
 
-// 创建示例配置文件
 func createDefaultConfig(path string) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -83,9 +88,9 @@ func createDefaultConfig(path string) error {
 	}
 
 	sample := `# ==============================================================================
-# sshtui 服务器列表配置文件
-# 文件位置: ~/.config/sshtui/servers.yaml
-# 文件权限会自动保持 600，保证密码安全性
+# sshtui server configuration
+# Location: ~/.config/sshtui/servers.yaml
+# Permissions are enforced as 0600 to protect passwords.
 # ==============================================================================
 
 default:
@@ -120,23 +125,62 @@ servers:
     auth: "key"
     key: "~/.ssh/id_ed25519"
 `
-	return os.WriteFile(path, []byte(sample), 0600)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if os.IsExist(err) {
+		return nil // Another process created it; never overwrite an existing config.
+	}
+	if err != nil {
+		return err
+	}
+	_, err = io.WriteString(f, sample)
+	return errors.Join(err, f.Close())
 }
 
-// 加载配置
-func loadConfig() (*Config, string, error) {
+// Check permissions on the descriptor that will be read to avoid path races.
+func openConfig() (*os.File, string, error) {
 	cfgPath, err := getConfigPath()
 	if err != nil {
 		return nil, "", err
 	}
 
-	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+	f, err := os.Open(cfgPath)
+	if os.IsNotExist(err) {
 		if err := createDefaultConfig(cfgPath); err != nil {
 			return nil, "", fmt.Errorf("创建默认配置文件失败: %w", err)
 		}
+		f, err = os.Open(cfgPath)
 	}
+	if err != nil {
+		return nil, "", fmt.Errorf("读取配置文件失败: %w", err)
+	}
+	if err := secureConfig(f); err != nil {
+		f.Close()
+		return nil, "", fmt.Errorf("检查配置文件及权限失败: %w", err)
+	}
+	return f, cfgPath, nil
+}
 
-	data, err := os.ReadFile(cfgPath)
+func secureConfig(f *os.File) error {
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("配置文件必须是普通文件")
+	}
+	if info.Mode().Perm() != 0600 {
+		return f.Chmod(0600)
+	}
+	return nil
+}
+
+func loadConfig() (*Config, string, error) {
+	f, cfgPath, err := openConfig()
+	if err != nil {
+		return nil, "", err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return nil, "", fmt.Errorf("读取配置文件失败: %w", err)
 	}
@@ -146,7 +190,6 @@ func loadConfig() (*Config, string, error) {
 		return nil, "", fmt.Errorf("解析 YAML 配置文件失败: %w", err)
 	}
 
-	// 补全全局保活默认值
 	if cfg.Default.ServerAliveInterval <= 0 {
 		cfg.Default.ServerAliveInterval = 30
 	}
@@ -156,20 +199,9 @@ func loadConfig() (*Config, string, error) {
 
 	for i := range cfg.Servers {
 		s := &cfg.Servers[i]
-		if s.User == "" {
-			if cfg.Default.User != "" {
-				s.User = cfg.Default.User
-			} else {
-				s.User = "root"
-			}
-		}
-		if s.Port == 0 {
-			if cfg.Default.Port != 0 {
-				s.Port = cfg.Default.Port
-			} else {
-				s.Port = 22
-			}
-		}
+		s.User = cmp.Or(s.User, cfg.Default.User, "root")
+		s.Port = cmp.Or(s.Port, cfg.Default.Port, 22)
+		s.Group = cmp.Or(s.Group, "Default")
 		if s.Auth == "" {
 			if s.Password != "" {
 				s.Auth = "password"
@@ -177,31 +209,35 @@ func loadConfig() (*Config, string, error) {
 				s.Auth = "key"
 			}
 		}
-		if s.Auth == "key" && s.Key == "" && cfg.Default.Key != "" {
-			s.Key = cfg.Default.Key
+		if s.Auth == "key" {
+			s.Key = cmp.Or(s.Key, cfg.Default.Key)
 		}
-		if s.Group == "" {
-			s.Group = "Default"
+		if s.Host == "" || s.Port < 1 || s.Port > 65535 {
+			return nil, "", fmt.Errorf("服务器 %q 的 host 不能为空，port 必须在 1–65535 之间", s.Name)
+		}
+		if s.Auth != "key" && s.Auth != "password" {
+			return nil, "", fmt.Errorf("服务器 %q 的 auth 必须是 key 或 password", s.Name)
+		}
+		fields := append([]string{s.Name, s.Group, s.Host, s.User, s.Key}, s.Args...)
+		for _, field := range fields {
+			if strings.ContainsRune(field, 0) {
+				return nil, "", fmt.Errorf("服务器 %q 的配置不能包含 NUL 字符", s.Name)
+			}
+		}
+		if err := validatePassword(s.Password); err != nil {
+			return nil, "", fmt.Errorf("服务器 %q: %w", s.Name, err)
 		}
 	}
 
-	// 按服务器名称以 A-z 自然字母序排序 (忽略大小写)
-	sort.SliceStable(cfg.Servers, func(i, j int) bool {
-		nameI := strings.ToLower(cfg.Servers[i].Name)
-		nameJ := strings.ToLower(cfg.Servers[j].Name)
-		if nameI == nameJ {
-			return cfg.Servers[i].Name < cfg.Servers[j].Name
-		}
-		return nameI < nameJ
+	slices.SortStableFunc(cfg.Servers, func(a, b ServerConfig) int {
+		return cmp.Or(strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name)), strings.Compare(a.Name, b.Name))
 	})
 
 	return &cfg, cfgPath, nil
 }
 
-// Model for Bubble Tea
 type model struct {
 	config      *Config
-	configPath  string
 	filter      string
 	filtered    []ServerConfig
 	cursor      int
@@ -212,13 +248,13 @@ type model struct {
 	quitting    bool
 }
 
-func initialModel(cfg *Config, cfgPath string, initialFilter string) model {
+func initialModel(cfg *Config, initialFilter string) model {
 	m := model{
 		config:      cfg,
-		configPath:  cfgPath,
 		filter:      initialFilter,
 		viewportTop: 0,
 		height:      24,
+		width:       80,
 	}
 	m.applyFilter()
 	return m
@@ -226,8 +262,7 @@ func initialModel(cfg *Config, cfgPath string, initialFilter string) model {
 
 func (m *model) applyFilter() {
 	if m.filter == "" {
-		m.filtered = make([]ServerConfig, len(m.config.Servers))
-		copy(m.filtered, m.config.Servers)
+		m.filtered = m.config.Servers
 	} else {
 		lowerFilter := strings.ToLower(m.filter)
 		var res []ServerConfig
@@ -240,24 +275,16 @@ func (m *model) applyFilter() {
 		m.filtered = res
 	}
 
-	if m.cursor >= len(m.filtered) {
-		m.cursor = len(m.filtered) - 1
-	}
-	if m.cursor < 0 {
-		m.cursor = 0
-	}
+	m.cursor = max(0, min(m.cursor, len(m.filtered)-1))
 	m.adjustViewport()
 }
 
 func (m *model) maxVisibleItems() int {
 	avail := m.height - 9
-	if avail < 5 {
-		return 5
+	if m.width < 74 || m.height < 14 {
+		avail = m.height - 3
 	}
-	if avail > 18 {
-		return 18
-	}
-	return avail
+	return min(18, max(1, avail))
 }
 
 func (m *model) adjustViewport() {
@@ -320,8 +347,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case tea.KeyEnter:
-			// 回车立即选中并退出 TUI，零中间等待直接发起连接
-			if len(m.filtered) > 0 && m.cursor < len(m.filtered) {
+			if m.width >= 16 && m.height >= 4 && len(m.filtered) > 0 && m.cursor < len(m.filtered) {
 				chosen := m.filtered[m.cursor]
 				m.selected = &chosen
 				return m, tea.Quit
@@ -346,17 +372,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	if m.quitting || m.selected != nil {
+	if m.quitting || m.selected != nil || m.width <= 0 || m.height <= 0 {
 		return ""
 	}
+	if m.width < 16 || m.height < 4 {
+		return runewidth.Truncate("窗口过小，请放大", max(0, m.width), "")
+	}
+	if m.width < 74 || m.height < 14 {
+		return m.compactView()
+	}
 
-	primaryColor := lipgloss.Color("#38bdf8")   // 亮天青
-	accentColor := lipgloss.Color("#a855f7")    // 紫色
-	dimColor := lipgloss.Color("#64748b")       // 中性灰
-	textColor := lipgloss.Color("#f8fafc")      // 亮文本
-	selectedBg := lipgloss.Color("#1e293b")     // 选中行高亮背景
-	keyBadgeColor := lipgloss.Color("#34d399")  // 绿色
-	passBadgeColor := lipgloss.Color("#fbbf24") // 琥珀橙
+	primaryColor := lipgloss.Color("#38bdf8")
+	accentColor := lipgloss.Color("#a855f7")
+	dimColor := lipgloss.Color("#64748b")
+	textColor := lipgloss.Color("#f8fafc")
+	selectedBg := lipgloss.Color("#1e293b")
+	keyBadgeColor := lipgloss.Color("#34d399")
+	passBadgeColor := lipgloss.Color("#fbbf24")
 
 	headerBox := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -365,7 +397,7 @@ func (m model) View() string {
 		Width(72)
 
 	searchPrompt := lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render("❯ Filter: ")
-	searchText := lipgloss.NewStyle().Foreground(textColor).Render(m.filter)
+	searchText := lipgloss.NewStyle().Foreground(textColor).Render(runewidth.TruncateLeft(m.filter, 56, "…"))
 	cursorBlock := lipgloss.NewStyle().Foreground(primaryColor).Render("▋")
 	searchBar := headerBox.Render(searchPrompt + searchText + cursorBlock)
 
@@ -385,80 +417,30 @@ func (m model) View() string {
 		b.WriteString(emptyMsg + "\n\n")
 	} else {
 		visible := m.maxVisibleItems()
-		end := m.viewportTop + visible
-		if end > len(m.filtered) {
-			end = len(m.filtered)
-		}
+		end := min(len(m.filtered), m.viewportTop+visible)
 
 		for i := m.viewportTop; i < end; i++ {
 			s := m.filtered[i]
 			isSelected := (i == m.cursor)
 
-			// 分组
-			groupStr := fmt.Sprintf("[%s]", s.Group)
-			groupWidth := 9
-			gw := runewidth.StringWidth(groupStr)
-			if gw < groupWidth {
-				groupStr += strings.Repeat(" ", groupWidth-gw)
-			}
-			groupStyle := lipgloss.NewStyle().Foreground(accentColor)
+			nameColor, connColor := textColor, dimColor
+			prefix := "   "
+			rowStyle := lipgloss.NewStyle().Padding(0, 1)
 			if isSelected {
-				groupStyle = groupStyle.Bold(true)
+				nameColor, connColor = primaryColor, textColor
+				prefix = lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render(" ❯ ")
+				rowStyle = rowStyle.Background(selectedBg)
 			}
-			renderedGroup := groupStyle.Render(groupStr)
-
-			// 认证徽章
-			var authBadge string
+			authBadge := lipgloss.NewStyle().Foreground(keyBadgeColor).Render("🔑 密钥")
 			if s.Auth == "password" {
 				authBadge = lipgloss.NewStyle().Foreground(passBadgeColor).Render("🔒 密码")
-			} else {
-				authBadge = lipgloss.NewStyle().Foreground(keyBadgeColor).Render("🔑 密钥")
 			}
-
-			// 名称 (自适应宽度，支持中文完整对齐)
-			nameWidth := 20
-			name := s.Name
-			nw := runewidth.StringWidth(name)
-			if nw > nameWidth {
-				name = runewidth.Truncate(name, nameWidth-2, "..")
-				nw = runewidth.StringWidth(name)
-			}
-			namePad := nameWidth - nw
-			if namePad > 0 {
-				name += strings.Repeat(" ", namePad)
-			}
-
-			// 连接目标
-			connStr := fmt.Sprintf("%s@%s:%d", s.User, s.Host, s.Port)
-			connWidth := 23
-			cw := runewidth.StringWidth(connStr)
-			if cw > connWidth {
-				connStr = runewidth.Truncate(connStr, connWidth-2, "..")
-				cw = runewidth.StringWidth(connStr)
-			}
-			connPad := connWidth - cw
-			if connPad > 0 {
-				connStr += strings.Repeat(" ", connPad)
-			}
-
-			prefix := "   "
-			if isSelected {
-				prefix = lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render(" ❯ ")
-			}
-
-			var line string
-			if isSelected {
-				nameStyled := lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render(name)
-				connStyled := lipgloss.NewStyle().Foreground(textColor).Render(connStr)
-				content := fmt.Sprintf("%s %s %s %s", renderedGroup, nameStyled, connStyled, authBadge)
-				line = prefix + lipgloss.NewStyle().Background(selectedBg).Padding(0, 1).Render(content)
-			} else {
-				nameStyled := lipgloss.NewStyle().Foreground(textColor).Render(name)
-				connStyled := lipgloss.NewStyle().Foreground(dimColor).Render(connStr)
-				content := fmt.Sprintf("%s %s %s %s", renderedGroup, nameStyled, connStyled, authBadge)
-				line = prefix + " " + content
-			}
-
+			content := fmt.Sprintf("%s %s %s %s",
+				lipgloss.NewStyle().Foreground(accentColor).Bold(isSelected).Render(fitColumn("["+s.Group+"]", 9)),
+				lipgloss.NewStyle().Foreground(nameColor).Bold(isSelected).Render(fitColumn(s.Name, 20)),
+				lipgloss.NewStyle().Foreground(connColor).Render(fitColumn(fmt.Sprintf("%s@%s:%d", s.User, s.Host, s.Port), 23)),
+				authBadge)
+			line := prefix + rowStyle.Render(content)
 			b.WriteString(line + "\n")
 		}
 	}
@@ -480,260 +462,295 @@ func (m model) View() string {
 	return b.String()
 }
 
-// 渲染高颜值过渡进度条 (填补 SSH 握手前 1~2 秒的黑屏空虚感)
-func showConnectingProgress(s *ServerConfig) {
-	primaryColor := "\033[38;2;56;189;248m"  // 亮天青 #38bdf8
-	successColor := "\033[38;2;52;211;153m"  // 翡翠绿 #34d399
-	accentColor  := "\033[38;2;168;85;247m"  // 紫色 #a855f7
-	dimColor     := "\033[38;2;100;116;139m" // 中性灰 #64748b
-	bold         := "\033[1m"
-	reset        := "\033[0m"
-
-	authBadge := "🔑 密钥"
-	if s.Auth == "password" {
-		authBadge = "🔒 密码"
-	}
-
-	fmt.Printf("\n %s🚀%s 正在连接 %s[%s]%s %s%s%s (%s@%s:%d) [%s]\n",
-		bold, reset,
-		accentColor, s.Group, reset,
-		bold+primaryColor, s.Name, reset,
-		s.User, s.Host, s.Port, authBadge,
-	)
-
-	steps := []struct {
-		percent int
-		text    string
-		frame   string
-		delay   time.Duration
-	}{
-		{20, "正在初始化加密会话与环境变量...", "⠋", 70 * time.Millisecond},
-		{50, "正在校验安全认证凭据...", "⠙", 80 * time.Millisecond},
-		{80, "正在建立安全通信信道...", "⠹", 80 * time.Millisecond},
-		{100, "信道就绪，移交交互终端！", "✓", 70 * time.Millisecond},
-	}
-
-	barWidth := 26
-	for _, step := range steps {
-		filled := int(float64(barWidth) * float64(step.percent) / 100.0)
-		empty := barWidth - filled
-		if empty < 0 {
-			empty = 0
-		}
-
-		color := primaryColor
-		if step.percent == 100 {
-			color = successColor
-		}
-
-		bar := strings.Repeat("━", filled) + strings.Repeat("╌", empty)
-
-		fmt.Printf("\r %s%s%s %s[%s]%s %3d%% %s%s%s",
-			color, step.frame, reset,
-			color, bar, reset,
-			step.percent,
-			dimColor, step.text, reset,
-		)
-		_ = os.Stdout.Sync()
-		time.Sleep(step.delay)
-	}
-
-	fmt.Printf("\n\n")
-	_ = os.Stdout.Sync()
+func fitColumn(s string, width int) string {
+	return runewidth.FillRight(runewidth.Truncate(s, width, "…"), width)
 }
 
-// 执行连接
+// Keep target details visible in narrow terminals.
+func (m model) compactView() string {
+	fit := func(s string) string { return runewidth.Truncate(s, m.width, "…") }
+	lines := []string{fit("⚡ SSH PICKER"), fit("❯ " + runewidth.TruncateLeft(m.filter, m.width-2, "…"))}
+	end := min(len(m.filtered), m.viewportTop+m.maxVisibleItems())
+	for i := m.viewportTop; i < end; i++ {
+		s := m.filtered[i]
+		address := fmt.Sprintf("%s@%s:%d", s.User, s.Host, s.Port)
+		addressWidth := min(runewidth.StringWidth(address), (m.width-3)*2/3)
+		nameWidth := m.width - addressWidth - 3
+		line := "  " + fitColumn(s.Name, nameWidth) + " " + runewidth.Truncate(address, addressWidth, "…")
+		if i == m.cursor {
+			line = "❯ " + strings.TrimPrefix(line, "  ")
+			line = lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Bold(true).Render(line)
+		}
+		lines = append(lines, line)
+	}
+	if len(m.filtered) == 0 {
+		lines = append(lines, fit("未找到服务器，Esc 清空"))
+	}
+	lines = append(lines, fit(fmt.Sprintf("↑↓ 选择 Enter 连接 Esc 返回 (%d/%d)", len(m.filtered), len(m.config.Servers))))
+	return strings.Join(lines, "\n")
+}
+
+// OpenSSH uses the first value, so explicit options must precede defaults.
+func sshOptions(s *ServerConfig, cfg *Config) []string {
+	args := append([]string(nil), s.Args...)
+	return append(args,
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", fmt.Sprintf("ServerAliveInterval=%d", cfg.Default.ServerAliveInterval),
+		"-o", fmt.Sprintf("ServerAliveCountMax=%d", cfg.Default.ServerAliveCountMax),
+		"-o", "TCPKeepAlive=yes")
+}
+
+func validatePassword(password string) error {
+	// OpenSSH reserves one byte in its 1024-byte prompt buffer for NUL.
+	if len(password) > 1023 {
+		return fmt.Errorf("密码不能超过 1023 个 UTF-8 字节（OpenSSH 限制）")
+	}
+	if strings.ContainsAny(password, "\x00\r\n") {
+		return fmt.Errorf("密码不能包含 NUL 或换行符")
+	}
+	return nil
+}
+
+func passwordPipe(password string) (*os.File, error) {
+	if err := validatePassword(password); err != nil {
+		return nil, err
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	// At most 1024 bytes fit in a macOS/Linux pipe before Exec starts the reader.
+	_, err = io.WriteString(w, password+"\n")
+	err = errors.Join(err, w.Close())
+	if err == nil {
+		_, err = unix.FcntlInt(r.Fd(), unix.F_SETFD, 0)
+	}
+	if err != nil {
+		r.Close()
+		return nil, err
+	}
+	return r, nil
+}
+
+// Only local SSH authentication can request the password through ASKPASS.
+// Keep the socket private and secrets out of argv, environment variables and scripts.
+func runWithAskpass(sshPath string, args []string, password string, env []string) error {
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	// Keep Unix socket paths below the platform's roughly 104-byte limit.
+	dir, err := os.MkdirTemp("/tmp", "sshtui-askpass-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "password.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = io.WriteString(conn, password+"\n")
+			conn.Close()
+		}
+	}()
+	cmd := exec.Command(sshPath, args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		if key != "SSH_ASKPASS" && key != "SSH_ASKPASS_REQUIRE" && key != "SSHTUI_ASKPASS_SOCKET" && key != "SSHTUI_ASKPASS_HELPER" {
+			cmd.Env = append(cmd.Env, entry)
+		}
+	}
+	cmd.Env = append(cmd.Env, "SSH_ASKPASS="+self, "SSH_ASKPASS_REQUIRE=force", "SSHTUI_ASKPASS_SOCKET="+path, "SSHTUI_ASKPASS_HELPER=1")
+	signals := make(chan os.Signal, 4)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGWINCH)
+	defer signal.Stop(signals)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			select {
+			case sig := <-signals:
+				_ = cmd.Process.Signal(sig)
+			case <-done:
+				return
+			}
+		}
+	}()
+	return cmd.Wait()
+}
+
+func answerAskpass() error {
+	// Never answer host confirmation or key passphrase prompts with a server password.
+	if os.Getenv("SSH_ASKPASS_PROMPT") != "" || len(os.Args) != 2 || !strings.Contains(strings.ToLower(os.Args[1]), "password") {
+		return fmt.Errorf("此 SSH 提示不能使用服务器密码自动回答")
+	}
+	conn, err := net.Dial("unix", os.Getenv("SSHTUI_ASKPASS_SOCKET"))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_, err = io.Copy(os.Stdout, conn)
+	return err
+}
+
 func connectToServer(s *ServerConfig, cfg *Config) error {
 	sshPath, err := exec.LookPath("ssh")
 	if err != nil {
 		return fmt.Errorf("未找到 ssh 命令: %w", err)
 	}
-
-	portStr := strconv.Itoa(s.Port)
-	target := fmt.Sprintf("%s@%s", s.User, s.Host)
-
-	// 重置终端状态
-	fmt.Print("\033[0m\033[?25h")
-
-	// 播放高颜值过渡进度条
-	showConnectingProgress(s)
-
-	env := os.Environ()
-	newEnv := make([]string, 0, len(env)+2)
-	for _, e := range env {
-		if strings.HasPrefix(e, "TERM=") {
-			continue
+	args := []string{"-p", strconv.Itoa(s.Port)}
+	if s.Auth == "key" && s.Key != "" {
+		args = append(args, "-i", expandPath(s.Key))
+	}
+	args = append(args, sshOptions(s, cfg)...)
+	args = append(args, "--", fmt.Sprintf("%s@%s", s.User, s.Host))
+	env := make([]string, 0, len(os.Environ())+2)
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "TERM=") {
+			env = append(env, e)
 		}
-		newEnv = append(newEnv, e)
 	}
-	newEnv = append(newEnv, "TERM=xterm-256color")
-
-	intervalStr := fmt.Sprintf("ServerAliveInterval=%d", cfg.Default.ServerAliveInterval)
-	countMaxStr := fmt.Sprintf("ServerAliveCountMax=%d", cfg.Default.ServerAliveCountMax)
-	keepAliveArgs := []string{
-		"-o", "StrictHostKeyChecking=accept-new",
-		"-o", intervalStr,
-		"-o", countMaxStr,
-		"-o", "TCPKeepAlive=yes",
+	env = append(env, "TERM=xterm-256color")
+	fmt.Fprintf(os.Stderr, "连接 [%s] %s (%s@%s:%d)\n", s.Group, s.Name, s.User, s.Host, s.Port)
+	if s.Auth != "password" {
+		return syscall.Exec(sshPath, append([]string{"ssh"}, args...), env)
 	}
 
-	if s.Auth == "password" {
-		sshpassPath, err := exec.LookPath("sshpass")
-		if err == nil {
-			args := []string{
-				"sshpass",
-				"-p", s.Password,
-				sshPath,
-			}
-			args = append(args, keepAliveArgs...)
-			args = append(args, "-p", portStr)
-			if len(s.Args) > 0 {
-				args = append(args, s.Args...)
-			}
-			args = append(args, target)
-
-			return syscall.Exec(sshpassPath, args, newEnv)
-		}
-
-		// Fallback: expect
-		expectPath, err := exec.LookPath("expect")
-		if err != nil {
-			return fmt.Errorf("密码登录需要 sshpass 或系统自带 expect。建议执行: brew install hudochenkov/sshpass/sshpass")
-		}
-
-		expectScript := fmt.Sprintf(`
-set timeout 30
-spawn %s -o StrictHostKeyChecking=accept-new -o %s -o %s -o TCPKeepAlive=yes -p %s %s
-expect {
-    "*password:*" { send "%s\r"; exp_continue }
-    "*yes/no*" { send "yes\r"; exp_continue }
-    timeout { puts "Connection timed out"; exit 1 }
-}
-interact
-`, sshPath, intervalStr, countMaxStr, portStr, target, s.Password)
-
-		args := []string{"expect", "-c", expectScript}
-		return syscall.Exec(expectPath, args, newEnv)
+	helper, err := exec.LookPath("sshpass")
+	if err != nil {
+		return runWithAskpass(sshPath, args, s.Password, env)
 	}
-
-	// 密钥登录
-	args := []string{"ssh"}
-	args = append(args, keepAliveArgs...)
-	args = append(args, "-p", portStr)
-	if s.Key != "" {
-		expandedKey := expandPath(s.Key)
-		args = append(args, "-i", expandedKey)
+	input, err := passwordPipe(s.Password)
+	if err != nil {
+		return fmt.Errorf("准备密码描述符失败: %w", err)
 	}
-	if len(s.Args) > 0 {
-		args = append(args, s.Args...)
-	}
-	args = append(args, target)
-
-	return syscall.Exec(sshPath, args, newEnv)
+	defer input.Close()
+	fd := strconv.FormatUint(uint64(input.Fd()), 10)
+	return syscall.Exec(helper, append([]string{"sshpass", "-d", fd, sshPath}, args...), env)
 }
 
-// 生成 Ansible Dynamic Inventory 标准 JSON
-func generateAnsibleJSON(cfg *Config) ([]byte, error) {
-	type HostVars map[string]interface{}
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
 
-	meta := map[string]interface{}{
-		"hostvars": make(map[string]HostVars),
+func inventoryName(s ServerConfig) string {
+	if name := strings.TrimSpace(s.Name); name != "" {
+		return name
 	}
+	return s.Host
+}
 
-	groups := make(map[string][]string)
-	allChildren := make(map[string]bool)
+func inventoryGroup(s ServerConfig) string {
+	if group := strings.TrimSpace(s.Group); group != "" {
+		return group
+	}
+	return "ungrouped"
+}
 
-	commonArgs := fmt.Sprintf("-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=%d -o ServerAliveCountMax=%d -o TCPKeepAlive=yes",
-		cfg.Default.ServerAliveInterval, cfg.Default.ServerAliveCountMax)
-
+func validateInventory(cfg *Config) error {
+	seen := make(map[string]bool)
 	for _, s := range cfg.Servers {
-		hostName := strings.TrimSpace(s.Name)
-		if hostName == "" {
-			hostName = s.Host
+		name := inventoryName(s)
+		if seen[name] {
+			return fmt.Errorf("Ansible 主机名称重复: %q，请为服务器设置不同的 name", name)
 		}
-
-		groupName := strings.TrimSpace(s.Group)
-		if groupName == "" {
-			groupName = "ungrouped"
+		seen[name] = true
+		g := inventoryGroup(s)
+		if g == "all" || g == "_meta" || strings.ContainsAny(g, "[]:\r\n") {
+			return fmt.Errorf("Ansible 分组名称无效或保留: %q", g)
 		}
-
-		groups[groupName] = append(groups[groupName], hostName)
-		allChildren[groupName] = true
-
-		vars := HostVars{
-			"ansible_host":            s.Host,
-			"ansible_port":            s.Port,
-			"ansible_user":            s.User,
-			"ansible_ssh_common_args": commonArgs,
-		}
-
-		if s.Auth == "password" && s.Password != "" {
-			vars["ansible_password"] = s.Password
-			vars["ansible_ssh_pass"] = s.Password
-		} else if s.Key != "" {
-			vars["ansible_ssh_private_key_file"] = expandPath(s.Key)
-		}
-
-		meta["hostvars"].(map[string]HostVars)[hostName] = vars
 	}
+	return nil
+}
 
-	result := make(map[string]interface{})
-	result["_meta"] = meta
+// Keep JSON and INI connection settings in sync.
+func inventoryVars(s ServerConfig, cfg *Config) map[string]interface{} {
+	options := sshOptions(&s, cfg)
+	for i := range options {
+		options[i] = shellQuote(options[i])
+	}
+	vars := map[string]interface{}{
+		"ansible_host":            s.Host,
+		"ansible_port":            s.Port,
+		"ansible_user":            s.User,
+		"ansible_ssh_common_args": strings.Join(options, " "),
+	}
+	if s.Auth == "password" {
+		vars["ansible_password"] = s.Password
+		vars["ansible_ssh_pass"] = s.Password
+	} else if s.Key != "" {
+		vars["ansible_ssh_private_key_file"] = expandPath(s.Key)
+	}
+	return vars
+}
 
-	var childrenList []string
+func generateAnsibleJSON(cfg *Config) ([]byte, error) {
+	if err := validateInventory(cfg); err != nil {
+		return nil, err
+	}
+	hostvars := make(map[string]interface{})
+	groups := make(map[string][]string)
+	for _, s := range cfg.Servers {
+		name, group := inventoryName(s), inventoryGroup(s)
+		groups[group] = append(groups[group], name)
+		hostvars[name] = inventoryVars(s, cfg)
+	}
+	result := map[string]interface{}{"_meta": map[string]interface{}{"hostvars": hostvars}}
+	children := make([]string, 0, len(groups))
 	for g, hosts := range groups {
-		result[g] = map[string]interface{}{
-			"hosts": hosts,
-		}
-		childrenList = append(childrenList, g)
+		result[g] = map[string]interface{}{"hosts": hosts}
+		children = append(children, g)
 	}
-
-	result["all"] = map[string]interface{}{
-		"children": childrenList,
-	}
-
+	slices.Sort(children)
+	result["all"] = map[string]interface{}{"children": children}
 	return json.MarshalIndent(result, "", "  ")
 }
 
-// 生成 Ansible INI 格式清单
-func generateAnsibleINI(cfg *Config) string {
+func generateAnsibleINI(cfg *Config) (string, error) {
+	if err := validateInventory(cfg); err != nil {
+		return "", err
+	}
 	var b strings.Builder
-	commonArgs := fmt.Sprintf("-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=%d -o ServerAliveCountMax=%d -o TCPKeepAlive=yes",
-		cfg.Default.ServerAliveInterval, cfg.Default.ServerAliveCountMax)
-
 	groups := make(map[string][]ServerConfig)
 	for _, s := range cfg.Servers {
-		g := strings.TrimSpace(s.Group)
-		if g == "" {
-			g = "ungrouped"
-		}
-		groups[g] = append(groups[g], s)
+		groups[inventoryGroup(s)] = append(groups[inventoryGroup(s)], s)
 	}
-
-	for g, list := range groups {
-		b.WriteString(fmt.Sprintf("[%s]\n", g))
-		for _, s := range list {
-			hostName := strings.TrimSpace(s.Name)
-			if hostName == "" {
-				hostName = s.Host
+	for _, g := range slices.Sorted(maps.Keys(groups)) {
+		fmt.Fprintf(&b, "[%s]\n", g)
+		for _, s := range groups[g] {
+			name := inventoryName(s)
+			if strings.ContainsAny(name, "[]:\r\n") {
+				return "", fmt.Errorf("Ansible INI 主机名称不能含 []、冒号或换行: %q，请改用 --ansible", name)
 			}
-			line := fmt.Sprintf("%-20s ansible_host=%s ansible_port=%d ansible_user=%s",
-				hostName, s.Host, s.Port, s.User)
-			if s.Auth == "password" && s.Password != "" {
-				line += fmt.Sprintf(" ansible_password=\"%s\" ansible_ssh_pass=\"%s\"", s.Password, s.Password)
-			} else if s.Key != "" {
-				line += fmt.Sprintf(" ansible_ssh_private_key_file=\"%s\"", expandPath(s.Key))
+			b.WriteString(shellQuote(name))
+			vars := inventoryVars(s, cfg)
+			for _, key := range slices.Sorted(maps.Keys(vars)) {
+				value := fmt.Sprint(vars[key])
+				if str, ok := vars[key].(string); ok {
+					// INI uses shlex followed by Python literal parsing; preserve both quoting layers.
+					value = shellQuote(strconv.Quote(str))
+				}
+				fmt.Fprintf(&b, " %s=%s", key, value)
 			}
-			line += fmt.Sprintf(" ansible_ssh_common_args=\"%s\"\n", commonArgs)
-			b.WriteString(line)
+			b.WriteByte('\n')
 		}
-		b.WriteString("\n")
+		b.WriteByte('\n')
 	}
-
-	return b.String()
+	return b.String(), nil
 }
 
-// 封装运行 Ansible 命令
 func runAnsibleCommand(targetGroup string, cmdStr string) error {
 	ansiblePath, err := exec.LookPath("ansible")
 	if err != nil {
@@ -753,160 +770,213 @@ func runAnsibleCommand(targetGroup string, cmdStr string) error {
 	fmt.Printf("💻 命令: %s\n\n", cmdStr)
 
 	cmd := exec.Command(ansiblePath, targetGroup, "-i", selfBin, "-m", "shell", "-a", cmdStr)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.Env = append(os.Environ(), "OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES")
 
 	return cmd.Run()
 }
 
-func main() {
+// Parse quoting and escapes without evaluating shell expressions.
+func splitEditor(command string) ([]string, error) {
+	var args []string
+	var word strings.Builder
+	var quote rune
+	escaped, started := false, false
+	for _, r := range command {
+		if escaped {
+			if quote == '"' && !strings.ContainsRune("$`\"\\\n", r) {
+				word.WriteRune('\\')
+			}
+			if r != '\n' {
+				word.WriteRune(r)
+			}
+			escaped = false
+			continue
+		}
+		if r == '\\' && quote != '\'' {
+			escaped, started = true, true
+		} else if quote != 0 {
+			if r == quote {
+				quote = 0
+			} else {
+				word.WriteRune(r)
+			}
+		} else if r == '\'' || r == '"' {
+			quote, started = r, true
+		} else if unicode.IsSpace(r) {
+			if started {
+				args = append(args, word.String())
+				word.Reset()
+				started = false
+			}
+		} else {
+			word.WriteRune(r)
+			started = true
+		}
+	}
+	if escaped || quote != 0 {
+		return nil, fmt.Errorf("EDITOR 的引号或反斜线不完整")
+	}
+	if started {
+		args = append(args, word.String())
+	}
+	if len(args) == 0 || args[0] == "" {
+		return nil, fmt.Errorf("EDITOR 不能为空")
+	}
+	args[0] = expandPath(args[0])
+	return args, nil
+}
+
+func editConfig() error {
+	f, path, err := openConfig()
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	editor := os.Getenv("EDITOR")
+	if strings.TrimSpace(editor) == "" {
+		editor = "vim"
+	}
+	args, err := splitEditor(editor)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(args[0], append(args[1:], path)...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	runErr := cmd.Run()
+	// Editors may replace the inode; recheck the saved file's permissions.
+	f, err = os.Open(path)
+	if err == nil {
+		err = secureConfig(f)
+		f.Close()
+	}
+	if err != nil {
+		return fmt.Errorf("编辑后检查配置文件失败: %w", err)
+	}
+	return runErr
+}
+
+func directMatch(servers []ServerConfig, term string) *ServerConfig {
+	var exact, partial *ServerConfig
+	exactCount, partialCount := 0, 0
+	lower := strings.ToLower(term)
+	for i := range servers {
+		if strings.EqualFold(servers[i].Name, term) {
+			exact, exactCount = &servers[i], exactCount+1
+		}
+		if strings.Contains(strings.ToLower(servers[i].Name), lower) {
+			partial, partialCount = &servers[i], partialCount+1
+		}
+	}
+	if exactCount == 1 {
+		return exact
+	}
+	if exactCount == 0 && partialCount == 1 {
+		return partial
+	}
+	return nil
+}
+
+func exitWithError(prefix string, err error) {
+	fmt.Fprintf(os.Stderr, "%s: %v\n", prefix, err)
+	if child, ok := err.(*exec.ExitError); ok {
+		if status, ok := child.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+			os.Exit(128 + int(status.Signal()))
+		}
+		os.Exit(child.ExitCode())
+	}
+	os.Exit(1)
+}
+
+func run() error {
 	if len(os.Args) > 1 && (os.Args[1] == "run" || os.Args[1] == "exec") {
 		runCmd := flag.NewFlagSet("run", flag.ExitOnError)
-		groupFlag := runCmd.String("g", "all", "指定目标主机组 (默认 all)")
+		group := runCmd.String("g", "all", "指定目标主机组 (默认 all)")
 		_ = runCmd.Parse(os.Args[2:])
-
-		args := runCmd.Args()
-		if len(args) == 0 {
-			fmt.Println("用法: s run [-g 分组] \"要执行的命令\"")
-			fmt.Println("示例: s run \"uptime\"")
-			fmt.Println("示例: s run -g Prod \"df -h\"")
-			os.Exit(1)
+		if runCmd.NArg() == 0 {
+			return fmt.Errorf("用法: s run [-g 分组] \"要执行的命令\"\n示例: s run -g Prod \"df -h\"")
 		}
-
-		cmdToRun := strings.Join(args, " ")
-		if err := runAnsibleCommand(*groupFlag, cmdToRun); err != nil {
-			os.Exit(1)
-		}
-		return
+		return runAnsibleCommand(*group, strings.Join(runCmd.Args(), " "))
 	}
 
-	editFlag := flag.Bool("e", false, "用系统编辑器直接打开配置文件编辑")
-	listTableFlag := flag.Bool("l", false, "纯文本表格列出所有配置的服务器")
-	pathFlag := flag.Bool("p", false, "打印配置文件所在绝对路径")
-	ansibleFlag := flag.Bool("ansible", false, "输出 Ansible Dynamic Inventory JSON 格式")
-	ansibleIniFlag := flag.Bool("ansible-ini", false, "输出 Ansible INI 格式")
-	ansibleListHook := flag.Bool("list", false, "Ansible 官方动态清单规范 Hook (等同于 --ansible)")
-	ansibleHostHook := flag.String("host", "", "Ansible 官方单机查询 Hook")
+	edit := flag.Bool("e", false, "用系统编辑器直接打开配置文件编辑")
+	list := flag.Bool("l", false, "纯文本表格列出所有配置的服务器")
+	path := flag.Bool("p", false, "打印配置文件所在绝对路径")
+	ansible := flag.Bool("ansible", false, "输出 Ansible Dynamic Inventory JSON 格式")
+	ini := flag.Bool("ansible-ini", false, "输出 Ansible INI 格式")
+	ansibleList := flag.Bool("list", false, "Ansible 官方动态清单规范 Hook (等同于 --ansible)")
+	ansibleHost := flag.String("host", "", "Ansible 官方单机查询 Hook")
 	flag.Parse()
 
+	if *path {
+		cfgPath, err := getConfigPath()
+		if err == nil {
+			fmt.Println(cfgPath)
+		}
+		return err
+	}
+	if *edit {
+		return editConfig()
+	}
 	cfg, cfgPath, err := loadConfig()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
-		os.Exit(1)
+		return err
 	}
-
-	if *pathFlag {
-		fmt.Println(cfgPath)
-		return
-	}
-
-	if *ansibleFlag || *ansibleListHook {
-		jsonBytes, err := generateAnsibleJSON(cfg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "生成 Ansible Inventory 失败: %v\n", err)
-			os.Exit(1)
+	switch {
+	case *ansible || *ansibleList:
+		data, err := generateAnsibleJSON(cfg)
+		if err == nil {
+			fmt.Println(string(data))
 		}
-		fmt.Println(string(jsonBytes))
-		return
-	}
-
-	if *ansibleHostHook != "" {
+		return err
+	case *ansibleHost != "":
 		fmt.Println("{}")
-		return
-	}
-
-	if *ansibleIniFlag {
-		fmt.Print(generateAnsibleINI(cfg))
-		return
-	}
-
-	if *editFlag {
-		editor := os.Getenv("EDITOR")
-		if editor == "" {
-			editor = "vim"
+		return nil
+	case *ini:
+		data, err := generateAnsibleINI(cfg)
+		if err == nil {
+			fmt.Print(data)
 		}
-		cmd := exec.Command(editor, cfgPath)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "打开编辑器失败: %v\n", err)
-			os.Exit(1)
-		}
-		return
-	}
-
-	if *listTableFlag {
+		return err
+	case *list:
 		fmt.Printf("配置文件: %s (共 %d 台)\n\n", cfgPath, len(cfg.Servers))
 		for i, s := range cfg.Servers {
-			authStr := "🔑 密钥"
+			auth := "🔑 密钥"
 			if s.Auth == "password" {
-				authStr = "🔒 密码"
+				auth = "🔒 密码"
 			}
-			fmt.Printf("%2d. [%s] %-20s %s@%s:%d (%s)\n",
-				i+1, s.Group, s.Name, s.User, s.Host, s.Port, authStr)
+			fmt.Printf("%2d. [%s] %-20s %s@%s:%d (%s)\n", i+1, s.Group, s.Name, s.User, s.Host, s.Port, auth)
+		}
+		return nil
+	}
+
+	filter := strings.TrimSpace(flag.Arg(0))
+	if filter != "" {
+		if target := directMatch(cfg.Servers, filter); target != nil {
+			return connectToServer(target, cfg)
+		}
+	}
+	p := tea.NewProgram(initialModel(cfg, filter), tea.WithAltScreen())
+	result, err := p.Run()
+	if err != nil {
+		return err
+	}
+	if m, ok := result.(model); ok && m.selected != nil {
+		return connectToServer(m.selected, cfg)
+	}
+	return nil
+}
+
+func main() {
+	if os.Getenv("SSHTUI_ASKPASS_HELPER") == "1" {
+		if err := answerAskpass(); err != nil {
+			os.Exit(1)
 		}
 		return
 	}
-
-	initialFilter := ""
-	if flag.NArg() > 0 {
-		searchTerm := strings.TrimSpace(flag.Arg(0))
-		if searchTerm != "" {
-			// 1. 优先完全精准匹配 (不区分大小写)
-			var exactMatches []ServerConfig
-			for _, s := range cfg.Servers {
-				if strings.EqualFold(s.Name, searchTerm) {
-					exactMatches = append(exactMatches, s)
-				}
-			}
-			if len(exactMatches) == 1 {
-				// 唯一精准匹配：直接直连，无需弹 TUI
-				target := exactMatches[0]
-				if err := connectToServer(&target, cfg); err != nil {
-					fmt.Fprintf(os.Stderr, "连接失败: %v\n", err)
-					os.Exit(1)
-				}
-				return
-			}
-
-			// 2. 模糊包含匹配 (按 Name 包含关键词)
-			lowerSearch := strings.ToLower(searchTerm)
-			var partialMatches []ServerConfig
-			for _, s := range cfg.Servers {
-				if strings.Contains(strings.ToLower(s.Name), lowerSearch) {
-					partialMatches = append(partialMatches, s)
-				}
-			}
-			if len(partialMatches) == 1 {
-				// 唯一模糊匹配：直接直连，无需弹 TUI
-				target := partialMatches[0]
-				if err := connectToServer(&target, cfg); err != nil {
-					fmt.Fprintf(os.Stderr, "连接失败: %v\n", err)
-					os.Exit(1)
-				}
-				return
-			}
-
-			// 匹配到多台机器 (如 s oracle 匹配多台) 则携带搜索词唤起 TUI 供选择
-			initialFilter = searchTerm
-		}
-	}
-
-	p := tea.NewProgram(initialModel(cfg, cfgPath, initialFilter), tea.WithAltScreen())
-	finalModel, err := p.Run()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "运行错误: %v\n", err)
-		os.Exit(1)
-	}
-
-	m, ok := finalModel.(model)
-	if ok && m.selected != nil {
-		if err := connectToServer(m.selected, cfg); err != nil {
-			fmt.Fprintf(os.Stderr, "连接失败: %v\n", err)
-			os.Exit(1)
-		}
+	if err := run(); err != nil {
+		exitWithError("错误", err)
 	}
 }

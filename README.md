@@ -10,13 +10,15 @@
 - **智能秒级直连（Smart Direct-Connect）**：
   - 敲 `s 备注`（如 `s 爱尔兰` 或 `s dmit`），唯一匹配时**直接跳过 TUI 毫秒直连**！
   - 匹配多台时（如 `s oracle`），**自动带着筛选词唤起 TUI** 供精准上下选。
-- **平滑流光过渡进度条（Smooth Progress Bar）**：
-  - 选定服务器或直连后，在移交原生 SSH 终端前呈现 300ms 现代霓虹流光进度条与动态 Spinner，无缝衔接网络握手期，告别黑屏空白感。
+- **立即移交 SSH**：
+  - 选定服务器或唯一匹配后立即启动 SSH，没有固定休眠、模拟进度条或额外网络预检。实际连接时间由网络和 SSH 认证决定。
 - **密码 & 密钥双轨支持**：
   - 密钥登录：直接调用原生 SSH。
-  - 密码登录：优先使用 `sshpass` 自动填充（若未安装则自动回退至系统内置 `expect`），告别手动输密。
-- **纯粹的原生终端体验（零性能损耗）**：
-  - 选定服务器后，通过 `syscall.Exec` 直接将当前进程替换为 SSH，**100% 保持原生终端所有能力**（支持 Tmux、Vim、完整真彩、窗口重绘、Ctrl+C、SSH-Agent 转发）。
+  - 密码登录：优先使用 `sshpass`，未安装时使用 OpenSSH 自带的 ASKPASS 机制（自动填密需要 OpenSSH 8.4+）。密码通过私有描述符或本地私有 Unix socket 传递，不放入命令行参数、环境变量或脚本。
+  - 自动填密只响应 SSH 本身的认证请求；登录后的远端程序输出 `password:` 不会触发代填。
+- **保留原生终端交互**：
+  - 密钥登录直接运行 SSH，sshpass 路径也通过 `syscall.Exec` 移交进程。ASKPASS 备用路径让 SSH 直接读写用户终端，支持窗口缩放、Ctrl+C 和退出码传递。
+  - 窄分屏自动使用紧凑布局；极小窗口提示放大，避免看不到目标时误连接。
 - **内置 Ghostty 乱码修复**：
   - Ghostty 默认传递 `TERM=xterm-ghostty`，在多数未装该 terminfo 的远程 Linux 上会导致 oh-my-zsh 提示符变 `?➜` 以及命令字符重叠。
   - 本工具在连接前自动将 TERM 重写为工业通用的 `xterm-256color`，从底层彻底解决远程乱码与光标错位。
@@ -25,8 +27,8 @@
   - 连续 3 次心跳无应答（如笔记本休眠合盖）时，客户端 90 秒内自动优雅断开退回本地终端，彻底告别强关窗口。
 - **极净退出机制（AltScreen）**：
   - 运行于终端备用缓冲屏，回车连接或退出时瞬间恢复干净的原生终端，不污染命令行历史缓冲区。
-- **极速免依赖**：
-  - 单一二进制文件（~3MB），零毫秒启动，不需要 Node.js、Python 或外部守护进程。
+- **单一二进制**：
+  - 不需要 Node.js、Python 或外部守护进程；连接和批量执行分别使用下文列出的系统命令。
 
 ---
 
@@ -39,7 +41,7 @@
 | **`s`** | **唤出 TUI 选择器**（支持实时打字过滤、上下方向键移动、回车连接） |
 | **`s 爱尔兰`** | **智能直连**：输入唯一备注或关键字（如 `s dmit`、`s 大阪`）**直接秒级连接，跳过 TUI**！ |
 | `s oracle` | 关键字匹配到多台时，**自动带着该关键词唤起 TUI 筛选列表**供快速上下选 |
-| **`s run "uptime"`** | **一键通过 Ansible 并发在所有 12 台机器上执行命令**（无需背复杂的 Ansible 参数） |
+| **`s run "uptime"`** | **通过 Ansible 在所有已配置机器上执行命令** |
 | `s run -g Prod "df -h"` | 只对特定分组（如 `Prod`）的所有机器并发执行命令 |
 | **`s -e`** | **快速打开配置文件**（调用默认编辑器 `$EDITOR` 或 vim 编辑 `servers.yaml`） |
 | `s -l` | 纯文本表格快速打印所有已配置的服务器列表（已按 A-z 字母序排列） |
@@ -52,28 +54,30 @@
 ## 🛠️ 配置文件说明
 
 配置文件默认保存在：  
-📁 **`~/.config/sshtui/servers.yaml`**（程序首次运行会自动生成模板，并强制设定权限为 `0600` 保护密码安全）。
+📁 **`~/.config/sshtui/servers.yaml`**（首次加载或编辑时自动生成模板；读取及编辑完成后检查权限并收紧为 `0600`）。
 
 也可以保存在 `~/.ssh/servers.yaml`（程序会自动探测）。
+
+`s -e` 和 `s -p` 不要求 YAML 能解析，因此配置写坏后仍可编辑或查看路径。`EDITOR` 支持参数和带引号的路径，例如 `code --wait`；不执行 shell 表达式。
 
 ### 配置格式示例
 
 ```yaml
 # ==============================================================================
-# sshtui 服务器配置
-# 路径: ~/.config/sshtui/servers.yaml (权限请保持 600)
+# sshtui server configuration
+# Path: ~/.config/sshtui/servers.yaml (keep mode 0600)
 # ==============================================================================
 
-# 全局默认设置 (服务器条目若未填，会自动继承此处默认值)
+# Server entries inherit omitted values from these defaults.
 default:
   user: root
   port: 22
   key: ~/.ssh/id_ed25519
-  server_alive_interval: 30 # 保活心跳间隔(秒)，默认 30，防超时卡死
-  server_alive_count_max: 3  # 最大重试次数，默认 3 次无响应自动断开
+  server_alive_interval: 30 # Keepalive interval in seconds; defaults to 30.
+  server_alive_count_max: 3  # Disconnect after three unanswered keepalives.
 
 servers:
-  # 1. 密码登录服务器
+  # Password authentication
   - name: "开发测试机-01"
     group: "Dev"
     host: "192.168.1.102"
@@ -82,7 +86,7 @@ servers:
     auth: "password"
     password: "your_password_here"
 
-  # 2. 密钥登录服务器
+  # Key authentication
   - name: "生产主库 (PostgreSQL)"
     group: "Prod"
     host: "10.0.0.5"
@@ -90,13 +94,15 @@ servers:
     user: "admin"
     auth: "key"
     key: "~/.ssh/id_ed25519"
-    args: ["-o", "ServerAliveInterval=60"] # 可选：支持传入任意原生 ssh 参数
+    args: ["-o", "ServerAliveInterval=60"] # Optional native SSH arguments.
 
-  # 3. 极简写法（自动继承 default 的 user、port、key）
+  # Minimal entry: inherit user, port and key.
   - name: "香港日常开发机"
     group: "Dev"
     host: "47.242.100.20"
 ```
+
+密码可包含引号、美元符号、反斜线和中文；最多 1023 个 UTF-8 字节（OpenSSH 限制），不接受换行及 NUL 字符，避免凭据工具静默截断。`args` 在密钥、sshpass、ASKPASS 和 Ansible 路径中都会保留，显式 `-o` 设置优先于内置默认值。
 
 ---
 
@@ -106,29 +112,30 @@ servers:
 
 ### 1. 动态清单直接运行（无需生成任何中间文件）
 ```bash
-# 查看所有 12 台机器的磁盘剩余空间 (使用进程替换)
-ansible all -i <(s --ansible) -m shell -a "df -h"
+# Ansible calls s --list to obtain the dynamic inventory.
+ansible all -i "$(command -v s)" -m shell -a "df -h"
 
-# 或者直接让 Ansible 将 s 命令识别为动态清单脚本
-ansible all -i $(which s) -m ping
+ansible all -i "$(command -v s)" -m ping
 
-# 只对特定分组 (例如 Prod) 执行命令
-ansible Prod -i <(s --ansible) -m shell -a "uptime"
+# Run only on a specific group.
+ansible Prod -i "$(command -v s)" -m shell -a "uptime"
 ```
 
 ### 2. 导出为静态 INI 主机清单
 ```bash
-# 导出一份干净的 hosts.ini
-s --ansible-ini > hosts.ini
+# Inventories may contain passwords; restrict output permissions.
+(umask 077; s --ansible-ini > hosts.ini)
 
-# 运行 playbook
+# Run a playbook.
 ansible-playbook -i hosts.ini my_playbook.yml
 ```
 
 > **参数自动映射说明**：
 > - 密钥登录自动映射为 `ansible_ssh_private_key_file`
 > - 密码登录自动映射为 `ansible_password` & `ansible_ssh_pass`
-> - 自动注入 `-o StrictHostKeyChecking=accept-new` 与心跳保活参数，批量执行不会因主机确认或超时挂死。
+> - 自动注入 `-o StrictHostKeyChecking=accept-new` 与心跳保活默认值，允许通过 `args` 覆盖。
+> - 主机名称（空名称使用 host）必须唯一；冲突时拒绝导出，避免把命令发往错误机器。`all` 和 `_meta` 为保留分组名。
+> - INI 支持带空格的名称和含引号的密码；主机别名含 `[]`、冒号或换行时请改用动态 JSON 清单。
 
 ---
 
@@ -138,7 +145,7 @@ ansible-playbook -i hosts.ini my_playbook.yml
 编辑你的 Ghostty 配置文件 `~/.config/ghostty/config`：
 
 ```ini
-# 按 Cmd+Shift+S 在当前窗口右侧切出分屏，并直接运行 s 服务器选择器
+# Open a split to the right with Cmd+Shift+S.
 keybind = super+shift+s=new_split:right
 ```
 
@@ -158,9 +165,18 @@ term = xterm-256color
 ```bash
 cd ~/sshtui
 
-# 编译并自动安装至 ~/.local/bin/sshtui 与 ~/.local/bin/s
+# Build and install ~/.local/bin/sshtui and ~/.local/bin/s.
 make install
 ```
+
+验证修复和回归行为：
+
+```bash
+go test ./...
+go vet ./...
+```
+
+测试通过本地替身验证 SSH 调用，不连接真实服务器。安装 `expect` 和 `ansible-inventory` 后，会额外检查终端交互和 INI 清单往返；`expect` 仅用作测试终端驱动。缺少对应工具时相关集成测试会跳过。
 
 ---
 
@@ -168,5 +184,6 @@ make install
 
 - **操作系统**：macOS (Apple Silicon / Intel) 或 Linux
 - **依赖命令**：
-  - `ssh`（系统自带）
-  - `sshpass`（用于密码登录自动填充，macOS 可通过 `brew install hudochenkov/sshpass/sshpass` 安装，若无则自动回退至系统内置 `expect`）
+  - `ssh`（系统自带；未安装 sshpass 时，自动填密需要 OpenSSH 8.4+）
+  - `sshpass`（可选的密码代填工具，macOS 可通过 `brew install hudochenkov/sshpass/sshpass` 安装）
+  - `ansible`（仅 `s run` 等批量运维命令需要）
