@@ -31,13 +31,15 @@
 
 | 命令 | 说明 |
 | :--- | :--- |
-| **`s`** | **唤出 TUI 选择器**（支持实时打字过滤、上下方向键移动、回车连接） |
+| **`s`** | **唤出 TUI 选择器**（支持实时打字过滤、上下方向键移动、回车连接，带网络预检与进度条动效） |
 | `s prod` | 唤出选择器并直接带入初始搜索词（例如只看 `prod` 机器） |
+| **`s run "uptime"`** | **一键通过 Ansible 并发在所有 12 台机器上执行命令**（无需背复杂的 Ansible 参数） |
+| `s run -g Prod "df -h"` | 只对特定分组（如 `Prod`）的所有机器并发执行命令 |
 | **`s -e`** | **快速打开配置文件**（调用默认编辑器 `$EDITOR` 或 vim 编辑 `servers.yaml`） |
-| `s -l` | 纯文本表格快速打印所有已配置的服务器列表（无 TTY 环境也可用） |
+| `s -l` | 纯文本表格快速打印所有已配置的服务器列表（已按 A-z 字母序排列） |
 | `s -p` | 打印当前使用的配置文件绝对路径 |
-| **`s --ansible`** | **输出 Ansible Dynamic Inventory JSON**（可直接供 Ansible 作为动态清单） |
-| `s --ansible-ini` | 输出 Ansible 标准 INI 清单格式（支持重定向保存为 `hosts.ini`） |
+| **`s --ansible`** | 输出 Ansible Dynamic Inventory JSON 格式 |
+| `s --ansible-ini` | 输出 Ansible 标准 INI 清单格式 |
 
 ---
 

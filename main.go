@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -91,6 +93,8 @@ default:
   user: root
   port: 22
   key: ~/.ssh/id_ed25519
+  server_alive_interval: 30
+  server_alive_count_max: 3
 
 servers:
   - name: "开发环境-应用服务"
@@ -143,7 +147,7 @@ func loadConfig() (*Config, string, error) {
 		return nil, "", fmt.Errorf("解析 YAML 配置文件失败: %w", err)
 	}
 
-	// 补全全局保活默认值 (30秒心跳，3次失败超时断开，彻底解决死锁)
+	// 补全全局保活默认值
 	if cfg.Default.ServerAliveInterval <= 0 {
 		cfg.Default.ServerAliveInterval = 30
 	}
@@ -182,7 +186,7 @@ func loadConfig() (*Config, string, error) {
 		}
 	}
 
-	// 需求1：按服务器名称以 A-z 自然字母序排序 (忽略大小写)
+	// 按服务器名称以 A-z 自然字母序排序 (忽略大小写)
 	sort.SliceStable(cfg.Servers, func(i, j int) bool {
 		nameI := strings.ToLower(cfg.Servers[i].Name)
 		nameJ := strings.ToLower(cfg.Servers[j].Name)
@@ -194,6 +198,41 @@ func loadConfig() (*Config, string, error) {
 
 	return &cfg, cfgPath, nil
 }
+
+// 状态机定义
+type appState int
+
+const (
+	stateSelecting appState = iota
+	stateConnecting
+	stateFailed
+)
+
+type tickMsg time.Time
+type probeResultMsg struct {
+	err error
+}
+type quitForConnectMsg struct{}
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(70*time.Millisecond, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
+}
+
+func probeCmd(host string, port int) tea.Cmd {
+	return func() tea.Msg {
+		addr := net.JoinHostPort(host, strconv.Itoa(port))
+		conn, err := net.DialTimeout("tcp", addr, 2500*time.Millisecond)
+		if err != nil {
+			return probeResultMsg{err: err}
+		}
+		_ = conn.Close()
+		return probeResultMsg{err: nil}
+	}
+}
+
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 // Model for Bubble Tea
 type model struct {
@@ -207,6 +246,13 @@ type model struct {
 	width       int
 	height      int
 	quitting    bool
+
+	// 连接与动效状态
+	state        appState
+	spinnerIdx   int
+	progress     float64 // 0.0 ~ 1.0
+	statusText   string
+	errorMessage string
 }
 
 func initialModel(cfg *Config, cfgPath string, initialFilter string) model {
@@ -216,6 +262,7 @@ func initialModel(cfg *Config, cfgPath string, initialFilter string) model {
 		filter:      initialFilter,
 		viewportTop: 0,
 		height:      24,
+		state:       stateSelecting,
 	}
 	m.applyFilter()
 	return m
@@ -283,6 +330,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.adjustViewport()
 		return m, nil
 
+	case tickMsg:
+		if m.state == stateConnecting {
+			m.spinnerIdx = (m.spinnerIdx + 1) % len(spinnerFrames)
+			if m.progress < 0.85 {
+				m.progress += 0.05
+				if m.progress > 0.4 && strings.HasPrefix(m.statusText, "正在准备") {
+					m.statusText = fmt.Sprintf("正在探测网络连通性 [%s:%d]...", m.selected.Host, m.selected.Port)
+				}
+			}
+			return m, tickCmd()
+		}
+
+	case probeResultMsg:
+		if m.state == stateConnecting {
+			if msg.err != nil {
+				m.state = stateFailed
+				m.errorMessage = fmt.Sprintf("%v", msg.err)
+				return m, nil
+			}
+			// 连通成功，进度直接冲到 100%
+			m.progress = 1.0
+			m.statusText = "✓ 网络握手成功，正在拉起原生 SSH 终端..."
+			return m, tea.Tick(200*time.Millisecond, func(_ time.Time) tea.Msg {
+				return quitForConnectMsg{}
+			})
+		}
+
+	case quitForConnectMsg:
+		return m, tea.Quit
+
 	case tea.KeyMsg:
 		switch msg.Type {
 		case tea.KeyCtrlC:
@@ -290,6 +367,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case tea.KeyEsc:
+			if m.state == stateConnecting || m.state == stateFailed {
+				m.state = stateSelecting
+				m.progress = 0
+				m.errorMessage = ""
+				return m, nil
+			}
 			if m.filter != "" {
 				m.filter = ""
 				m.applyFilter()
@@ -299,32 +382,47 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case tea.KeyUp, tea.KeyCtrlP:
-			if m.cursor > 0 {
-				m.cursor--
-			} else if len(m.filtered) > 0 {
-				m.cursor = len(m.filtered) - 1
+			if m.state == stateSelecting {
+				if m.cursor > 0 {
+					m.cursor--
+				} else if len(m.filtered) > 0 {
+					m.cursor = len(m.filtered) - 1
+				}
+				m.adjustViewport()
 			}
-			m.adjustViewport()
 			return m, nil
 
 		case tea.KeyDown, tea.KeyCtrlN:
-			if m.cursor < len(m.filtered)-1 {
-				m.cursor++
-			} else {
-				m.cursor = 0
+			if m.state == stateSelecting {
+				if m.cursor < len(m.filtered)-1 {
+					m.cursor++
+				} else {
+					m.cursor = 0
+				}
+				m.adjustViewport()
 			}
-			m.adjustViewport()
 			return m, nil
 
 		case tea.KeyEnter:
-			if len(m.filtered) > 0 && m.cursor < len(m.filtered) {
-				chosen := m.filtered[m.cursor]
-				m.selected = &chosen
+			if m.state == stateSelecting {
+				if len(m.filtered) > 0 && m.cursor < len(m.filtered) {
+					chosen := m.filtered[m.cursor]
+					m.selected = &chosen
+					m.state = stateConnecting
+					m.progress = 0.2
+					m.statusText = "正在准备安全连接凭证与环境..."
+					return m, tea.Batch(
+						tickCmd(),
+						probeCmd(chosen.Host, chosen.Port),
+					)
+				}
+			} else if m.state == stateFailed {
+				// 检测失败时按回车允许强制尝试连接
 				return m, tea.Quit
 			}
 
 		case tea.KeyBackspace:
-			if len(m.filter) > 0 {
+			if m.state == stateSelecting && len(m.filter) > 0 {
 				r := []rune(m.filter)
 				m.filter = string(r[:len(r)-1])
 				m.applyFilter()
@@ -332,8 +430,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case tea.KeyRunes:
-			m.filter += string(msg.Runes)
-			m.applyFilter()
+			if m.state == stateSelecting {
+				m.filter += string(msg.Runes)
+				m.applyFilter()
+			}
 			return m, nil
 		}
 	}
@@ -341,9 +441,86 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// 绘制进度条
+func renderBar(width int, progress float64) string {
+	if progress > 1.0 {
+		progress = 1.0
+	}
+	if progress < 0.0 {
+		progress = 0.0
+	}
+	filled := int(float64(width) * progress)
+	empty := width - filled
+	if empty < 0 {
+		empty = 0
+	}
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", empty)
+	return fmt.Sprintf("[%s] %3.0f%%", bar, progress*100)
+}
+
 func (m model) View() string {
-	if m.quitting || m.selected != nil {
+	if m.quitting {
 		return ""
+	}
+
+	// 正在连接或检测失败的卡片视图
+	if m.state == stateConnecting || m.state == stateFailed {
+		primaryColor := lipgloss.Color("#38bdf8")   // 亮天青
+		accentColor := lipgloss.Color("#a855f7")    // 紫色
+		dimColor := lipgloss.Color("#64748b")       // 中性灰
+		successColor := lipgloss.Color("#22c55e")   // 绿色
+		dangerColor := lipgloss.Color("#ef4444")    // 红色
+
+		boxStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(primaryColor).
+			Padding(1, 2).
+			Width(68)
+
+		var card strings.Builder
+		titleStyle := lipgloss.NewStyle().Bold(true).Foreground(primaryColor)
+		card.WriteString(titleStyle.Render("⚡ GHOSTTY SSH PICKER") + "\n\n")
+
+		authBadge := "🔑 密钥认证"
+		if m.selected.Auth == "password" {
+			authBadge = "🔒 密码认证"
+		}
+
+		card.WriteString(fmt.Sprintf("  目标节点: %s  %s\n",
+			lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#f8fafc")).Render(m.selected.Name),
+			lipgloss.NewStyle().Foreground(accentColor).Render("["+m.selected.Group+"]"),
+		))
+		card.WriteString(fmt.Sprintf("  连接配置: %s  (%s)\n\n",
+			lipgloss.NewStyle().Foreground(dimColor).Render(fmt.Sprintf("%s@%s:%d", m.selected.User, m.selected.Host, m.selected.Port)),
+			lipgloss.NewStyle().Foreground(primaryColor).Render(authBadge),
+		))
+
+		if m.state == stateConnecting {
+			sp := spinnerFrames[m.spinnerIdx]
+			spStyle := lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render(sp)
+			statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#e2e8f0")).Render(m.statusText)
+			card.WriteString(fmt.Sprintf("  %s %s\n\n", spStyle, statusStyle))
+
+			barColor := primaryColor
+			if m.progress >= 1.0 {
+				barColor = successColor
+			}
+			progressBar := lipgloss.NewStyle().Foreground(barColor).Bold(true).Render(renderBar(30, m.progress))
+			card.WriteString(fmt.Sprintf("  %s\n\n", progressBar))
+			card.WriteString(lipgloss.NewStyle().Foreground(dimColor).Render("  按 [Esc] 取消并返回列表\n"))
+		} else {
+			// stateFailed
+			errIcon := lipgloss.NewStyle().Foreground(dangerColor).Bold(true).Render("❌ 网络预检未通过")
+			card.WriteString(fmt.Sprintf("  %s\n", errIcon))
+			card.WriteString(lipgloss.NewStyle().Foreground(dangerColor).Render(fmt.Sprintf("  原因: %s\n\n", m.errorMessage)))
+			card.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#fbbf24")).Render("  提示: 主机可能处于关机、离线、或安全组未开放 22 端口状态。\n\n"))
+			card.WriteString(fmt.Sprintf("  %s  %s\n",
+				lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render("[Enter] 强制尝试SSH连接"),
+				lipgloss.NewStyle().Foreground(dimColor).Render("[Esc] 返回列表"),
+			))
+		}
+
+		return "\n" + boxStyle.Render(card.String()) + "\n"
 	}
 
 	// 现代色彩风格 (与 Pi 极度契合的深灰/亮青/琥珀风格)
@@ -490,21 +667,16 @@ func connectToServer(s *ServerConfig, cfg *Config) error {
 	// 重置终端所有颜色和光标状态，防止上一帧控制字符残留
 	fmt.Print("\033[0m\033[?25h")
 
-	// 需求2：在 Ghostty 标签页最上方显示当前连接的服务器备注
+	// 设置 Ghostty 标签页最上方显示当前连接的服务器备注
 	tabTitle := s.Name
 	if s.Group != "" && s.Group != "Default" {
 		tabTitle = fmt.Sprintf("[%s] %s (%s)", s.Group, s.Name, s.Host)
 	} else {
 		tabTitle = fmt.Sprintf("%s (%s)", s.Name, s.Host)
 	}
-	// 发送 OSC 0 控制序列，实时设置 Ghostty 窗口与标签页标题
 	fmt.Printf("\033]0;%s\007", tabTitle)
 	_ = os.Stdout.Sync()
 
-	// 解决 Ghostty 核心乱码问题：
-	// Ghostty 默认设置 TERM=xterm-ghostty，远程 Linux 服务器通常没有该 terminfo，
-	// 导致 oh-my-zsh / bash 无法解析光标与符号，出现 '?➜' 乱码与光标重叠。
-	// 这里将本地进程的 TERM 强制替换为工业标准通用的 xterm-256color，SSH 协议会自动以 xterm-256color 协商 PTY。
 	env := os.Environ()
 	newEnv := make([]string, 0, len(env)+2)
 	for _, e := range env {
@@ -515,10 +687,6 @@ func connectToServer(s *ServerConfig, cfg *Config) error {
 	}
 	newEnv = append(newEnv, "TERM=xterm-256color")
 
-	// 核心修复：防止长时间不操作导致连接挂起/死锁卡死
-	// 1. ServerAliveInterval: 客户端定时发送心跳保活数据包，防止中间 NAT/防火墙静默丢弃空闲 TCP 连接
-	// 2. ServerAliveCountMax: 连续多次心跳无响应时，客户端自动断开连接退回本地 Shell，绝不死锁
-	// 3. TCPKeepAlive: 开启底层 TCP KeepAlive 探测
 	intervalStr := fmt.Sprintf("ServerAliveInterval=%d", cfg.Default.ServerAliveInterval)
 	countMaxStr := fmt.Sprintf("ServerAliveCountMax=%d", cfg.Default.ServerAliveCountMax)
 	keepAliveArgs := []string{
@@ -594,7 +762,6 @@ func generateAnsibleJSON(cfg *Config) ([]byte, error) {
 	groups := make(map[string][]string)
 	allChildren := make(map[string]bool)
 
-	// 通用 SSH 参数：严格保活防断开、禁用未知主机交互提示
 	commonArgs := fmt.Sprintf("-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=%d -o ServerAliveCountMax=%d -o TCPKeepAlive=yes",
 		cfg.Default.ServerAliveInterval, cfg.Default.ServerAliveCountMax)
 
@@ -685,7 +852,56 @@ func generateAnsibleINI(cfg *Config) string {
 	return b.String()
 }
 
+// 封装运行 Ansible 命令
+func runAnsibleCommand(targetGroup string, cmdStr string) error {
+	ansiblePath, err := exec.LookPath("ansible")
+	if err != nil {
+		return fmt.Errorf("未找到 ansible 命令，请确保已安装: brew install ansible")
+	}
+
+	selfBin, err := os.Executable()
+	if err != nil {
+		selfBin = "s"
+	}
+
+	if targetGroup == "" {
+		targetGroup = "all"
+	}
+
+	fmt.Printf("🚀 正在通过 Ansible 批量执行 (目标: %s)...\n", targetGroup)
+	fmt.Printf("💻 命令: %s\n\n", cmdStr)
+
+	cmd := exec.Command(ansiblePath, targetGroup, "-i", selfBin, "-m", "shell", "-a", cmdStr)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), "OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES")
+
+	return cmd.Run()
+}
+
 func main() {
+	// 支持极简一键并发命令: s run "uptime" 或 s run -g Prod "df -h"
+	if len(os.Args) > 1 && (os.Args[1] == "run" || os.Args[1] == "exec") {
+		runCmd := flag.NewFlagSet("run", flag.ExitOnError)
+		groupFlag := runCmd.String("g", "all", "指定目标主机组 (默认 all)")
+		_ = runCmd.Parse(os.Args[2:])
+
+		args := runCmd.Args()
+		if len(args) == 0 {
+			fmt.Println("用法: s run [-g 分组] \"要执行的命令\"")
+			fmt.Println("示例: s run \"uptime\"")
+			fmt.Println("示例: s run -g Prod \"df -h\"")
+			os.Exit(1)
+		}
+
+		cmdToRun := strings.Join(args, " ")
+		if err := runAnsibleCommand(*groupFlag, cmdToRun); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
 	editFlag := flag.Bool("e", false, "用系统编辑器直接打开配置文件编辑")
 	listTableFlag := flag.Bool("l", false, "纯文本表格列出所有配置的服务器")
 	pathFlag := flag.Bool("p", false, "打印配置文件所在绝对路径")
@@ -706,6 +922,26 @@ func main() {
 		return
 	}
 
+	if *ansibleFlag || *ansibleListHook {
+		jsonBytes, err := generateAnsibleJSON(cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "生成 Ansible Inventory 失败: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(jsonBytes))
+		return
+	}
+
+	if *ansibleHostHook != "" {
+		fmt.Println("{}")
+		return
+	}
+
+	if *ansibleIniFlag {
+		fmt.Print(generateAnsibleINI(cfg))
+		return
+	}
+
 	if *editFlag {
 		editor := os.Getenv("EDITOR")
 		if editor == "" {
@@ -719,27 +955,6 @@ func main() {
 			fmt.Fprintf(os.Stderr, "打开编辑器失败: %v\n", err)
 			os.Exit(1)
 		}
-		return
-	}
-
-	if *ansibleFlag || *ansibleListHook {
-		jsonBytes, err := generateAnsibleJSON(cfg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "生成 Ansible Inventory 失败: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println(string(jsonBytes))
-		return
-	}
-
-	if *ansibleHostHook != "" {
-		// Ansible 规范要求单机 host 查询返回 JSON 字典，变量已合并在 _meta 中
-		fmt.Println("{}")
-		return
-	}
-
-	if *ansibleIniFlag {
-		fmt.Print(generateAnsibleINI(cfg))
 		return
 	}
 
@@ -761,7 +976,6 @@ func main() {
 		initialFilter = flag.Arg(0)
 	}
 
-	// 使用 WithAltScreen() 确保退出时终端恢复为干净的原生屏幕，不留残影
 	p := tea.NewProgram(initialModel(cfg, cfgPath, initialFilter), tea.WithAltScreen())
 	finalModel, err := p.Run()
 	if err != nil {
