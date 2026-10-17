@@ -15,6 +15,9 @@
 - **内置 Ghostty 乱码修复**：
   - Ghostty 默认传递 `TERM=xterm-ghostty`，在多数未装该 terminfo 的远程 Linux 上会导致 oh-my-zsh 提示符变 `?➜` 以及命令字符重叠。
   - 本工具在连接前自动将 TERM 重写为工业通用的 `xterm-256color`，从底层彻底解决远程乱码与光标错位。
+- **自动心跳防卡死（KeepAlive & Auto-Timeout）**：
+  - 默认开启客户端保活心跳（每 30 秒探测一次），防止中间 NAT 网关或云厂商路由器静默断开空闲 TCP 连接导致窗口死锁。
+  - 连续 3 次心跳无应答（如笔记本休眠合盖）时，客户端 90 秒内自动优雅断开退回本地终端，彻底告别强关窗口。
 - **极净退出机制（AltScreen）**：
   - 运行于终端备用缓冲屏，回车连接或退出时瞬间恢复干净的原生终端，不污染命令行历史缓冲区。
 - **极速免依赖**：
@@ -56,6 +59,8 @@ default:
   user: root
   port: 22
   key: ~/.ssh/id_ed25519
+  server_alive_interval: 30 # 保活心跳间隔(秒)，默认 30，防超时卡死
+  server_alive_count_max: 3  # 最大重试次数，默认 3 次无响应自动断开
 
 servers:
   # 1. 密码登录服务器
