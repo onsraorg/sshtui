@@ -1,0 +1,125 @@
+# ⚡ sshtui (Ghostty SSH Picker)
+
+专为 **Ghostty** 终端量身定制的轻量、极速 SSH 服务器连接选择器。交互与视觉设计深度契合 **Pi 现代终端美学**，支持密码与密钥双轨登录、实时模糊搜索与单键直连。
+
+---
+
+## ✨ 核心特性
+
+- **现代 TUI 质感**：基于 Bubble Tea & Lip Gloss 开发，支持打字即搜（实时过滤名称、IP、分组、用户）、上下微调、高亮徽章与视口滚动。
+- **密码 & 密钥双轨支持**：
+  - 密钥登录：直接调用原生 SSH。
+  - 密码登录：优先使用 `sshpass` 自动填充（若未安装则自动回退至系统内置 `expect`），告别手动输密。
+- **纯粹的原生终端体验（零性能损耗）**：
+  - 选定服务器后，通过 `syscall.Exec` 直接将当前进程替换为 SSH，**100% 保持原生终端所有能力**（支持 Tmux、Vim、完整真彩、窗口重绘、Ctrl+C、SSH-Agent 转发）。
+- **内置 Ghostty 乱码修复**：
+  - Ghostty 默认传递 `TERM=xterm-ghostty`，在多数未装该 terminfo 的远程 Linux 上会导致 oh-my-zsh 提示符变 `?➜` 以及命令字符重叠。
+  - 本工具在连接前自动将 TERM 重写为工业通用的 `xterm-256color`，从底层彻底解决远程乱码与光标错位。
+- **极净退出机制（AltScreen）**：
+  - 运行于终端备用缓冲屏，回车连接或退出时瞬间恢复干净的原生终端，不污染命令行历史缓冲区。
+- **极速免依赖**：
+  - 单一二进制文件（~3MB），零毫秒启动，不需要 Node.js、Python 或外部守护进程。
+
+---
+
+## 🚀 快速使用
+
+安装后系统已内置全局超短别名 `s`：
+
+| 命令 | 说明 |
+| :--- | :--- |
+| **`s`** | **唤出 TUI 选择器**（支持实时打字过滤、上下方向键移动、回车连接） |
+| `s prod` | 唤出选择器并直接带入初始搜索词（例如只看 `prod` 机器） |
+| **`s -e`** | **快速打开配置文件**（调用默认编辑器 `$EDITOR` 或 vim 编辑 `servers.yaml`） |
+| `s -l` | 纯文本表格快速打印所有已配置的服务器列表（无 TTY 环境也可用） |
+| `s -p` | 打印当前使用的配置文件绝对路径 |
+
+---
+
+## 🛠️ 配置文件说明
+
+配置文件默认保存在：  
+📁 **`~/.config/sshtui/servers.yaml`**（程序首次运行会自动生成模板，并强制设定权限为 `0600` 保护密码安全）。
+
+也可以保存在 `~/.ssh/servers.yaml`（程序会自动探测）。
+
+### 配置格式示例
+
+```yaml
+# ==============================================================================
+# sshtui 服务器配置
+# 路径: ~/.config/sshtui/servers.yaml (权限请保持 600)
+# ==============================================================================
+
+# 全局默认设置 (服务器条目若未填，会自动继承此处默认值)
+default:
+  user: root
+  port: 22
+  key: ~/.ssh/id_ed25519
+
+servers:
+  # 1. 密码登录服务器
+  - name: "开发测试机-01"
+    group: "Dev"
+    host: "192.168.1.102"
+    port: 22
+    user: "root"
+    auth: "password"
+    password: "your_password_here"
+
+  # 2. 密钥登录服务器
+  - name: "生产主库 (PostgreSQL)"
+    group: "Prod"
+    host: "10.0.0.5"
+    port: 2222
+    user: "admin"
+    auth: "key"
+    key: "~/.ssh/id_ed25519"
+    args: ["-o", "ServerAliveInterval=60"] # 可选：支持传入任意原生 ssh 参数
+
+  # 3. 极简写法（自动继承 default 的 user、port、key）
+  - name: "香港日常开发机"
+    group: "Dev"
+    host: "47.242.100.20"
+```
+
+---
+
+## 👻 Ghostty 进阶联动技巧
+
+### 1. 配置专属快捷键（右侧分屏一键唤出）
+编辑你的 Ghostty 配置文件 `~/.config/ghostty/config`：
+
+```ini
+# 按 Cmd+Shift+S 在当前窗口右侧切出分屏，并直接运行 s 服务器选择器
+keybind = super+shift+s=new_split:right
+```
+
+### 2. 终端标题与全局 TERM（推荐）
+如果你日常也有手动敲原生 `ssh` 的习惯，建议在 `~/.config/ghostty/config` 中加入：
+```ini
+term = xterm-256color
+```
+确保所有终端连接均使用兼容性最好的终端定义。
+
+---
+
+## 📦 编译与重新安装
+
+本项目源码存放于：`~/sshtui`。如果后续想自行修改界面颜色、字段或增加功能，可以随时编译：
+
+```bash
+cd ~/sshtui
+
+# 编译并自动安装至 ~/.local/bin/sshtui 与 ~/.local/bin/s
+make install
+```
+
+---
+
+## 📋 依赖要求
+
+- **操作系统**：macOS (Apple Silicon / Intel) 或 Linux
+- **依赖命令**：
+  - `ssh`（系统自带）
+  - `sshpass`（用于密码登录自动填充，macOS 可通过 `brew install hudochenkov/sshpass/sshpass` 安装，若无则自动回退至系统内置 `expect`）

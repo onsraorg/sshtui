@@ -1,0 +1,14 @@
+# Binaries
+sshtui
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test or temp
+*.out
+*.tmp
+
+# OS
+.DS_Store
