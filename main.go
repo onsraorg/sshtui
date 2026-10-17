@@ -32,9 +32,11 @@ type ServerConfig struct {
 // Config 全局配置结构
 type Config struct {
 	Default struct {
-		User string `yaml:"user"`
-		Port int    `yaml:"port"`
-		Key  string `yaml:"key"`
+		User                string `yaml:"user"`
+		Port                int    `yaml:"port"`
+		Key                 string `yaml:"key"`
+		ServerAliveInterval int    `yaml:"server_alive_interval"` // 心跳间隔秒数，默认 30
+		ServerAliveCountMax int    `yaml:"server_alive_count_max"` // 探测失败重试次数，默认 3
 	} `yaml:"default"`
 	Servers []ServerConfig `yaml:"servers"`
 }
@@ -137,6 +139,14 @@ func loadConfig() (*Config, string, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, "", fmt.Errorf("解析 YAML 配置文件失败: %w", err)
+	}
+
+	// 补全全局保活默认值 (30秒心跳，3次失败超时断开，彻底解决死锁)
+	if cfg.Default.ServerAliveInterval <= 0 {
+		cfg.Default.ServerAliveInterval = 30
+	}
+	if cfg.Default.ServerAliveCountMax <= 0 {
+		cfg.Default.ServerAliveCountMax = 3
 	}
 
 	for i := range cfg.Servers {
@@ -456,7 +466,7 @@ func (m model) View() string {
 }
 
 // 执行连接
-func connectToServer(s *ServerConfig) error {
+func connectToServer(s *ServerConfig, cfg *Config) error {
 	sshPath, err := exec.LookPath("ssh")
 	if err != nil {
 		return fmt.Errorf("未找到 ssh 命令: %w", err)
@@ -483,6 +493,19 @@ func connectToServer(s *ServerConfig) error {
 	}
 	newEnv = append(newEnv, "TERM=xterm-256color")
 
+	// 核心修复：防止长时间不操作导致连接挂起/死锁卡死
+	// 1. ServerAliveInterval: 客户端定时发送心跳保活数据包，防止中间 NAT/防火墙静默丢弃空闲 TCP 连接
+	// 2. ServerAliveCountMax: 连续多次心跳无响应时，客户端自动断开连接退回本地 Shell，绝不死锁
+	// 3. TCPKeepAlive: 开启底层 TCP KeepAlive 探测
+	intervalStr := fmt.Sprintf("ServerAliveInterval=%d", cfg.Default.ServerAliveInterval)
+	countMaxStr := fmt.Sprintf("ServerAliveCountMax=%d", cfg.Default.ServerAliveCountMax)
+	keepAliveArgs := []string{
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", intervalStr,
+		"-o", countMaxStr,
+		"-o", "TCPKeepAlive=yes",
+	}
+
 	if s.Auth == "password" {
 		sshpassPath, err := exec.LookPath("sshpass")
 		if err == nil {
@@ -490,9 +513,9 @@ func connectToServer(s *ServerConfig) error {
 				"sshpass",
 				"-p", s.Password,
 				sshPath,
-				"-o", "StrictHostKeyChecking=accept-new",
-				"-p", portStr,
 			}
+			args = append(args, keepAliveArgs...)
+			args = append(args, "-p", portStr)
 			if len(s.Args) > 0 {
 				args = append(args, s.Args...)
 			}
@@ -509,25 +532,23 @@ func connectToServer(s *ServerConfig) error {
 
 		expectScript := fmt.Sprintf(`
 set timeout 30
-spawn %s -o StrictHostKeyChecking=accept-new -p %s %s
+spawn %s -o StrictHostKeyChecking=accept-new -o %s -o %s -o TCPKeepAlive=yes -p %s %s
 expect {
     "*password:*" { send "%s\r"; exp_continue }
     "*yes/no*" { send "yes\r"; exp_continue }
     timeout { puts "Connection timed out"; exit 1 }
 }
 interact
-`, sshPath, portStr, target, s.Password)
+`, sshPath, intervalStr, countMaxStr, portStr, target, s.Password)
 
 		args := []string{"expect", "-c", expectScript}
 		return syscall.Exec(expectPath, args, newEnv)
 	}
 
 	// 密钥登录
-	args := []string{
-		"ssh",
-		"-o", "StrictHostKeyChecking=accept-new",
-		"-p", portStr,
-	}
+	args := []string{"ssh"}
+	args = append(args, keepAliveArgs...)
+	args = append(args, "-p", portStr)
 	if s.Key != "" {
 		expandedKey := expandPath(s.Key)
 		args = append(args, "-i", expandedKey)
@@ -601,7 +622,7 @@ func main() {
 
 	m, ok := finalModel.(model)
 	if ok && m.selected != nil {
-		if err := connectToServer(m.selected); err != nil {
+		if err := connectToServer(m.selected, cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "连接失败: %v\n", err)
 			os.Exit(1)
 		}
