@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -28,6 +30,17 @@ import (
 func TestMain(m *testing.M) {
 	if os.Getenv("SSHTUI_TEST_PROCESS") == "1" {
 		switch filepath.Base(os.Args[0]) {
+		case "osascript":
+			if len(os.Args) == 6 {
+				writeTestRecord(".title-set", os.Args[4:])
+				if os.Getenv("SSHTUI_TEST_TITLE_FAIL") == "1" {
+					os.Exit(1)
+				}
+				fmt.Print("test-terminal-id")
+			} else {
+				writeTestRecord(".title-reset", os.Args[4:])
+			}
+			os.Exit(0)
 		case "sshpass":
 			fd, _ := strconv.Atoi(os.Args[2])
 			f := os.NewFile(uintptr(fd), "password")
@@ -45,6 +58,14 @@ func TestMain(m *testing.M) {
 			writeTestRecord(".ansible", os.Args[1:])
 			os.Exit(7)
 		case "ssh":
+			if mode := os.Getenv("SSHTUI_TEST_CONNECTING"); mode != "" {
+				if mode == "failure" {
+					time.Sleep(400 * time.Millisecond)
+					os.Exit(255)
+				}
+				time.Sleep(10 * time.Second)
+				os.Exit(255)
+			}
 			for _, value := range append(os.Environ(), os.Args...) {
 				if strings.Contains(value, "audit-private-marker") {
 					panic("password leaked into subprocess arguments or environment")
@@ -61,6 +82,7 @@ func TestMain(m *testing.M) {
 			writeTestRecord(".args", os.Args[1:])
 			writeTestRecord(".term", os.Getenv("TERM"))
 			if mode := os.Getenv("SSHTUI_TEST_SESSION"); mode != "" {
+				time.Sleep(300 * time.Millisecond)
 				if _, err := term.MakeRaw(int(os.Stdin.Fd())); err != nil {
 					panic(err)
 				}
@@ -145,7 +167,7 @@ func testEnv(overrides map[string]string) []string {
 	var env []string
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
-		if _, replaced := overrides[key]; !replaced {
+		if _, replaced := overrides[key]; !replaced && key != "TERM_PROGRAM" {
 			env = append(env, entry)
 		}
 	}
@@ -207,6 +229,16 @@ func TestConfigPermissionsAndDefaults(t *testing.T) {
 	after, _ := os.ReadFile(path)
 	if string(before) != string(after) {
 		t.Fatal("existing config was overwritten")
+	}
+}
+
+func TestVersionWorksWithoutValidConfig(t *testing.T) {
+	home, _ := configFixture(t, "servers: [broken\n")
+	for _, arg := range []string{"--version", "-v"} {
+		out, err := cliCommand(t, map[string]string{"HOME": home}, arg).CombinedOutput()
+		if err != nil || string(out) != "sshtui "+strings.TrimSpace(version)+"\n" {
+			t.Fatalf("%s: got %q, %v", arg, out, err)
+		}
 	}
 }
 
@@ -382,17 +414,68 @@ func TestSSHOptionsRespectOverrides(t *testing.T) {
 	}
 	cfg := &Config{}
 	cfg.Default.ServerAliveInterval, cfg.Default.ServerAliveCountMax = 30, 3
-	s := ServerConfig{Args: []string{"-o", "ServerAliveInterval=60", "-o", "StrictHostKeyChecking=yes", "-J", "jump"}}
+	s := ServerConfig{Args: []string{"-o", "ServerAliveInterval=60", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=25", "-o", "ConnectionAttempts=2", "-J", "jump"}}
 	args := append([]string{"-G", "-F", "/dev/null"}, sshOptions(&s, cfg)...)
 	out, err := exec.Command(ssh, append(args, "dummy.invalid")...).Output()
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"serveraliveinterval 60\n", "stricthostkeychecking true\n", "proxyjump jump\n"} {
+	for _, expected := range []string{"serveraliveinterval 60\n", "stricthostkeychecking true\n", "connecttimeout 25\n", "connectionattempts 2\n", "proxyjump jump\n"} {
 		if !strings.Contains(string(out), expected) {
 			t.Errorf("effective options missing %q", expected)
 		}
 	}
+}
+
+func TestSSHHandshakeTimeout(t *testing.T) {
+	ssh, err := exec.LookPath("ssh")
+	if err != nil {
+		t.Skip("ssh is not installed")
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		accepted <- err
+		if err == nil {
+			defer conn.Close()
+			// Accept TCP but never send an SSH banner, simulating a stalled server.
+			_, _ = io.Copy(io.Discard, conn)
+		}
+	}()
+	home, _ := configFixture(t, fmt.Sprintf("servers:\n  - {name: node, host: 127.0.0.1, port: %d, args: ['-F', /dev/null]}\n", listener.Addr().(*net.TCPAddr).Port))
+	bin := t.TempDir()
+	linkHelper(t, bin, "ssh", ssh)
+	binary, _ := os.Executable()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binary, "node")
+	cmd.Env = testEnv(map[string]string{"HOME": home, "PATH": bin, "SSHTUI_TEST_PROCESS": "1"})
+	start := time.Now()
+	out, err := cmd.CombinedOutput()
+	elapsed := time.Since(start)
+	if ctx.Err() != nil {
+		t.Fatalf("stalled SSH connection did not time out: %v; output: %s", ctx.Err(), out)
+	}
+	if err == nil || err.(*exec.ExitError).ExitCode() != 255 || !strings.Contains(string(out), "Connection timed out") {
+		t.Fatalf("expected SSH timeout and exit 255: %v; output: %s", err, out)
+	}
+	select {
+	case err := <-accepted:
+		if err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatal("SSH never reached the stalled server")
+	}
+	if elapsed < 9*time.Second || elapsed > 14*time.Second {
+		t.Fatalf("expected default 10-second timeout, took %s", elapsed)
+	}
+	t.Logf("stalled handshake timed out after %s with SSH exit 255", elapsed)
 }
 
 func TestDirectMatch(t *testing.T) {
@@ -433,14 +516,18 @@ func TestViewFitsWindowAndKeepsSelectionVisible(t *testing.T) {
 	}
 }
 
-func TestKeyAndSshpassExec(t *testing.T) {
-	for _, auth := range []string{"key", "password"} {
-		t.Run(auth, func(t *testing.T) {
+func TestSSHInvocation(t *testing.T) {
+	for _, backend := range []string{"key", "sshpass", "askpass"} {
+		t.Run(backend, func(t *testing.T) {
+			auth := "password"
+			if backend == "key" {
+				auth = "key"
+			}
 			home, _ := configFixture(t, "servers:\n  - {name: node, host: 192.0.2.1, auth: "+auth+", password: dummy-secret, key: '~/.ssh/key', args: ['-J', jump]}\n")
 			bin := t.TempDir()
 			binary, _ := os.Executable()
 			linkHelper(t, bin, "ssh", binary)
-			if auth == "password" {
+			if backend == "sshpass" {
 				linkHelper(t, bin, "sshpass", binary)
 			}
 			log := filepath.Join(t.TempDir(), "log")
@@ -448,15 +535,69 @@ func TestKeyAndSshpassExec(t *testing.T) {
 			if err == nil || err.(*exec.ExitError).ExitCode() != 17 {
 				t.Fatalf("SSH exit code was not preserved: %v %s", err, out)
 			}
+			if strings.Contains(string(out), "\x1b[") || strings.Contains(string(out), "正在连接") {
+				t.Fatalf("non-terminal output contains animation: %q", out)
+			}
 			args := readRecord[[]string](t, log+".args")
 			if !strings.Contains(strings.Join(args, " "), "-J jump") || readRecord[string](t, log+".term") != "xterm-256color" {
 				t.Fatalf("SSH arguments/environment: %q", args)
 			}
-			if auth == "password" {
+			for _, option := range []string{"ConnectTimeout=10", "ConnectionAttempts=1"} {
+				if !slices.Contains(args, option) {
+					t.Errorf("SSH invocation missing %s: %q", option, args)
+				}
+			}
+			if backend == "sshpass" {
 				helper := readRecord[[]string](t, log+".helper")
 				if readRecord[string](t, log+".password") != "dummy-secret\n" || helper[1] != "-d" || strings.Contains(strings.Join(helper, " "), "dummy-secret") {
 					t.Fatal("password must use a descriptor, not argv")
 				}
+			}
+		})
+	}
+}
+
+func TestConnectionProgressFailureAndCancel(t *testing.T) {
+	expect, err := exec.LookPath("expect")
+	if err != nil {
+		t.Skip("expect is not installed")
+	}
+	for _, mode := range []string{"failure", "cancel"} {
+		t.Run(mode, func(t *testing.T) {
+			home, _ := configFixture(t, "servers:\n  - {name: node, host: 192.0.2.1, auth: key}\n")
+			bin := t.TempDir()
+			binary, _ := os.Executable()
+			linkHelper(t, bin, "ssh", binary)
+			driver := `
+set timeout 4
+spawn -noecho $env(SSHTUI_TEST_BINARY) node
+expect {
+    -re {0\.[1-9]s} {}
+    timeout { puts stderr "No waiting animation"; exit 101 }
+    eof { exit 102 }
+}
+if {$env(SSHTUI_TEST_CONNECTING) eq "cancel"} { send -- "\003" }
+expect {
+    eof {}
+    timeout { puts stderr "SSH failed to exit"; exit 103 }
+}
+set result [wait]
+exit [lindex $result 3]
+`
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, expect, "-c", driver)
+			cmd.Env = testEnv(map[string]string{"HOME": home, "PATH": bin, "TERM": "xterm-256color", "SSHTUI_TEST_PROCESS": "1", "SSHTUI_TEST_BINARY": binary, "SSHTUI_TEST_CONNECTING": mode})
+			out, err := cmd.CombinedOutput()
+			wantExit := 255
+			if mode == "cancel" {
+				wantExit = 130
+			}
+			if ctx.Err() != nil || err == nil || err.(*exec.ExitError).ExitCode() != wantExit {
+				t.Fatalf("connection %s: %v; output: %s", mode, err, out)
+			}
+			if !strings.Contains(string(out), "\x1b[1A\r\x1b[2K") {
+				t.Fatalf("connection animation was not cleared: %q", out)
 			}
 		})
 	}
@@ -467,17 +608,40 @@ func TestPasswordHelperInteractiveSession(t *testing.T) {
 	if err != nil {
 		t.Skip("expect is not installed")
 	}
-	for _, tc := range []struct{ backend, mode string }{{"askpass", "password"}, {"askpass", "agent"}, {"sshpass", "password"}} {
-		t.Run(tc.backend+"/"+tc.mode, func(t *testing.T) {
+	for _, tc := range []struct {
+		backend, mode         string
+		ghostty, titleFailure bool
+	}{
+		{"askpass", "password", false, false},
+		{"askpass", "agent", false, false},
+		{"sshpass", "password", false, false},
+		{"key", "agent", true, false},
+		{"askpass", "password", true, false},
+		{"sshpass", "password", true, false},
+		{"key", "agent", true, true},
+	} {
+		t.Run(fmt.Sprintf("%s/%s/ghostty=%t/failure=%t", tc.backend, tc.mode, tc.ghostty, tc.titleFailure), func(t *testing.T) {
+			if tc.ghostty && runtime.GOOS != "darwin" {
+				t.Skip("Ghostty tab integration is macOS-only")
+			}
 			mode := tc.mode
 			marker := filepath.Join(t.TempDir(), "must-not-exist")
 			password := `audit-private-marker中文$word"\[close [open ` + marker + ` w]];` + strings.Repeat("x", 600)
 			cfg := Config{Servers: []ServerConfig{{Name: "node", Host: "192.0.2.1", Auth: "password", Password: password, Args: []string{"-J", "jump with spaces"}}}}
+			if tc.backend == "key" {
+				cfg.Servers[0].Auth = "key"
+			}
+			if tc.ghostty {
+				cfg.Servers[0].Name = "node 大阪 \"引号\" \\路径\x07\x1b"
+			}
 			data, _ := yaml.Marshal(cfg)
 			home, _ := configFixture(t, string(data))
 			bin := t.TempDir()
 			binary, _ := os.Executable()
 			linkHelper(t, bin, "ssh", binary)
+			if tc.ghostty {
+				linkHelper(t, bin, "osascript", binary)
+			}
 			if tc.backend == "sshpass" {
 				sshpass, err := exec.LookPath("sshpass")
 				if err != nil {
@@ -496,9 +660,20 @@ func TestPasswordHelperInteractiveSession(t *testing.T) {
 set timeout 4
 spawn -noecho $env(SSHTUI_TEST_BINARY) node
 expect {
+    -re {0\.[1-9]s} {}
+    timeout { puts stderr "Connection animation did not advance"; exit 110 }
+    eof { exit 111 }
+}
+expect {
     READY {}
     timeout { puts stderr "No interactive session after authentication"; exit 101 }
     eof { puts stderr "Session closed before READY"; exit 102 }
+}
+after 200
+expect -timeout 0 {
+    -re {[0-9]+\.[0-9]s} { puts stderr "Connection animation continued into session"; exit 112 }
+    timeout {}
+    eof { exit 113 }
 }
 exec stty rows 30 columns 100 < $spawn_out(slave,name) 2>@stderr
 send -- "size\r"
@@ -534,7 +709,14 @@ exit [lindex $result 3]
 			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 			defer cancel()
 			cmd := exec.CommandContext(ctx, expect, "-c", driver)
-			cmd.Env = testEnv(map[string]string{"HOME": home, "PATH": bin, "SSHTUI_TEST_PROCESS": "1", "SSHTUI_TEST_BINARY": binary, "SSHTUI_TEST_LOG": log, "SSHTUI_TEST_SESSION": mode, "SSHTUI_TEST_BACKEND": tc.backend})
+			env := map[string]string{"HOME": home, "PATH": bin, "SSHTUI_TEST_PROCESS": "1", "SSHTUI_TEST_BINARY": binary, "SSHTUI_TEST_LOG": log, "SSHTUI_TEST_SESSION": mode, "SSHTUI_TEST_BACKEND": tc.backend, "TMUX": "", "TERM": "xterm-256color"}
+			if tc.ghostty {
+				env["TERM_PROGRAM"] = "ghostty"
+			}
+			if tc.titleFailure {
+				env["SSHTUI_TEST_TITLE_FAIL"] = "1"
+			}
+			cmd.Env = testEnv(env)
 			out, err := cmd.CombinedOutput()
 			wantExit := 17
 			if mode == "agent" {
@@ -556,6 +738,19 @@ exit [lindex $result 3]
 			}
 			if args := readRecord[[]string](t, log+".args"); !strings.Contains(strings.Join(args, "|"), "-J|jump with spaces") {
 				t.Fatalf("SSH arguments were split or lost: %q", args)
+			}
+			if tc.ghostty {
+				set := readRecord[[]string](t, log+".title-set")
+				if len(set) != 2 || !strings.HasPrefix(set[0], "sshtui-") || set[1] != "node 大阪 \"引号\" \\路径" {
+					t.Fatalf("server remark was not safely passed as title: %q", set)
+				}
+				if tc.titleFailure {
+					if !strings.Contains(string(out), "设置 Ghostty 标签标题失败，继续连接") {
+						t.Fatalf("missing title failure message: %s", out)
+					}
+				} else if reset := readRecord[[]string](t, log+".title-reset"); !slices.Equal(reset, []string{"test-terminal-id"}) {
+					t.Fatalf("title reset did not target the original terminal: %q", reset)
+				}
 			}
 			if tc.backend == "askpass" {
 				path := readRecord[string](t, log+".socket")

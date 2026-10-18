@@ -2,6 +2,8 @@ package main
 
 import (
 	"cmp"
+	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,18 +15,25 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
 	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
 )
+
+//go:embed VERSION
+var version string
 
 // ServerConfig describes one SSH target.
 type ServerConfig struct {
@@ -495,6 +504,8 @@ func sshOptions(s *ServerConfig, cfg *Config) []string {
 	args := append([]string(nil), s.Args...)
 	return append(args,
 		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "ConnectTimeout=10",
+		"-o", "ConnectionAttempts=1",
 		"-o", fmt.Sprintf("ServerAliveInterval=%d", cfg.Default.ServerAliveInterval),
 		"-o", fmt.Sprintf("ServerAliveCountMax=%d", cfg.Default.ServerAliveCountMax),
 		"-o", "TCPKeepAlive=yes")
@@ -562,7 +573,6 @@ func runWithAskpass(sshPath string, args []string, password string, env []string
 		}
 	}()
 	cmd := exec.Command(sshPath, args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	for _, entry := range env {
 		key, _, _ := strings.Cut(entry, "=")
 		if key != "SSH_ASKPASS" && key != "SSH_ASKPASS_REQUIRE" && key != "SSHTUI_ASKPASS_SOCKET" && key != "SSHTUI_ASKPASS_HELPER" {
@@ -570,6 +580,16 @@ func runWithAskpass(sshPath string, args []string, password string, env []string
 		}
 	}
 	cmd.Env = append(cmd.Env, "SSH_ASKPASS="+self, "SSH_ASKPASS_REQUIRE=force", "SSHTUI_ASKPASS_SOCKET="+path, "SSHTUI_ASKPASS_HELPER=1")
+	return runSSH(cmd)
+}
+
+func runSSH(cmd *exec.Cmd) error {
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if progress := startConnectionProgress(); progress != nil {
+		defer progress.stop(true)
+		cmd.Stdout = connectionOutput{progress, os.Stdout}
+		cmd.Stderr = connectionOutput{progress, os.Stderr}
+	}
 	signals := make(chan os.Signal, 4)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGWINCH)
 	defer signal.Stop(signals)
@@ -589,6 +609,141 @@ func runWithAskpass(sshPath string, args []string, password string, env []string
 		}
 	}()
 	return cmd.Wait()
+}
+
+type connectionProgress struct {
+	mu     sync.Mutex
+	active bool
+	done   chan struct{}
+}
+
+func startConnectionProgress() *connectionProgress {
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stderr.Fd())) || os.Getenv("TERM") == "dumb" {
+		return nil
+	}
+	if width, _, err := term.GetSize(int(os.Stderr.Fd())); err == nil && width > 0 && width < 40 {
+		return nil
+	}
+	state, err := term.GetState(int(os.Stdin.Fd()))
+	if err != nil {
+		return nil
+	}
+	p := &connectionProgress{active: true, done: make(chan struct{})}
+	start := time.Now()
+	style := lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8"))
+	frames := []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+	fmt.Fprintln(os.Stderr, style.Render("  ⠋ 正在连接 · 已等待 0.0s"))
+	go func() {
+		ticker := time.NewTicker(80 * time.Millisecond)
+		defer ticker.Stop()
+		for frame := 1; ; frame++ {
+			select {
+			case <-p.done:
+				return
+			case <-ticker.C:
+				current, err := term.GetState(int(os.Stdin.Fd()))
+				if err != nil || *current != *state {
+					// Password prompts use /dev/tty directly; leave their cursor untouched.
+					p.stop(false)
+					return
+				}
+				p.mu.Lock()
+				if p.active {
+					line := fmt.Sprintf("  %c 正在连接 · 已等待 %.1fs", frames[frame%len(frames)], time.Since(start).Seconds())
+					fmt.Fprintf(os.Stderr, "\x1b7\x1b[1A\r\x1b[2K%s\x1b8", style.Render(line))
+				}
+				p.mu.Unlock()
+			}
+		}
+	}()
+	return p
+}
+
+func (p *connectionProgress) stop(clear bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.active {
+		p.active = false
+		close(p.done)
+		if clear {
+			fmt.Fprint(os.Stderr, "\x1b[1A\r\x1b[2K")
+		}
+	}
+}
+
+type connectionOutput struct {
+	progress *connectionProgress
+	output   io.Writer
+}
+
+func (w connectionOutput) Write(data []byte) (int, error) {
+	w.progress.stop(true)
+	return w.output.Write(data)
+}
+
+func ghosttyScript(script string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "osascript", append([]string{"-e", script, "--"}, args...)...).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func pinGhosttyTabTitle(s *ServerConfig) func() {
+	if runtime.GOOS != "darwin" || os.Getenv("TERM_PROGRAM") != "ghostty" || os.Getenv("TMUX") != "" {
+		return nil
+	}
+	tty, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0)
+	if err != nil {
+		return nil
+	}
+	title := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, inventoryName(*s))
+	// Identify this surface by a unique OSC title, even if the user switches tabs.
+	marker := fmt.Sprintf("sshtui-%d-%d", os.Getpid(), time.Now().UnixNano())
+	_, err = fmt.Fprintf(tty, "\x1b]2;%s\x1b\\", marker)
+	if err != nil {
+		tty.Close()
+		return nil
+	}
+	id, err := ghosttyScript(`on run argv
+	tell application "Ghostty"
+		repeat 50 times
+			set matches to every terminal whose name is (item 1 of argv)
+			if (count of matches) > 0 then
+				set targetTerminal to item 1 of matches
+				if not (perform action ("set_tab_title:" & item 2 of argv) on targetTerminal) then error "Cannot set tab title"
+				return id of targetTerminal
+			end if
+			delay 0.02
+		end repeat
+		error "Cannot find current Ghostty terminal"
+	end tell
+end run`, marker, title)
+	_, _ = fmt.Fprintf(tty, "\x1b]2;%s\x1b\\", title)
+	if err != nil {
+		tty.Close()
+		fmt.Fprintf(os.Stderr, "设置 Ghostty 标签标题失败，继续连接: %v\n", err)
+		return nil
+	}
+	return func() {
+		defer tty.Close()
+		_, err := ghosttyScript(`on run argv
+	tell application "Ghostty"
+		if not (perform action "set_tab_title:" on terminal id (item 1 of argv)) then error "Cannot reset tab title"
+	end tell
+end run`, id)
+		_, _ = fmt.Fprint(tty, "\x1b]2;\x1b\\")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "恢复 Ghostty 标签标题失败: %v\n", err)
+		}
+	}
 }
 
 func answerAskpass() error {
@@ -623,8 +778,23 @@ func connectToServer(s *ServerConfig, cfg *Config) error {
 		}
 	}
 	env = append(env, "TERM=xterm-256color")
-	fmt.Fprintf(os.Stderr, "连接 [%s] %s (%s@%s:%d)\n", s.Group, s.Name, s.User, s.Host, s.Port)
+	if term.IsTerminal(int(os.Stderr.Fd())) {
+		name := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#38bdf8")).Render("❯ " + inventoryName(*s))
+		detail := lipgloss.NewStyle().Foreground(lipgloss.Color("#64748b")).Render(fmt.Sprintf("  [%s] %s@%s:%d", s.Group, s.User, s.Host, s.Port))
+		fmt.Fprintf(os.Stderr, "\n%s\n%s\n", name, detail)
+	} else {
+		fmt.Fprintf(os.Stderr, "连接 [%s] %s (%s@%s:%d)\n", s.Group, s.Name, s.User, s.Host, s.Port)
+	}
+	restoreTitle := pinGhosttyTabTitle(s)
+	if restoreTitle != nil {
+		defer restoreTitle()
+	}
 	if s.Auth != "password" {
+		if restoreTitle != nil || (term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stderr.Fd()))) {
+			cmd := exec.Command(sshPath, args...)
+			cmd.Env = env
+			return runSSH(cmd)
+		}
 		return syscall.Exec(sshPath, append([]string{"ssh"}, args...), env)
 	}
 
@@ -637,6 +807,11 @@ func connectToServer(s *ServerConfig, cfg *Config) error {
 		return fmt.Errorf("准备密码描述符失败: %w", err)
 	}
 	defer input.Close()
+	if restoreTitle != nil || (term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stderr.Fd()))) {
+		cmd := exec.Command(helper, append([]string{"-d", "3", sshPath}, args...)...)
+		cmd.Env, cmd.ExtraFiles = env, []*os.File{input}
+		return runSSH(cmd)
+	}
 	fd := strconv.FormatUint(uint64(input.Fd()), 10)
 	return syscall.Exec(helper, append([]string{"sshpass", "-d", fd, sshPath}, args...), env)
 }
@@ -902,6 +1077,9 @@ func run() error {
 	}
 
 	edit := flag.Bool("e", false, "用系统编辑器直接打开配置文件编辑")
+	var showVersion bool
+	flag.BoolVar(&showVersion, "version", false, "显示版本号")
+	flag.BoolVar(&showVersion, "v", false, "显示版本号")
 	list := flag.Bool("l", false, "纯文本表格列出所有配置的服务器")
 	path := flag.Bool("p", false, "打印配置文件所在绝对路径")
 	ansible := flag.Bool("ansible", false, "输出 Ansible Dynamic Inventory JSON 格式")
@@ -910,6 +1088,10 @@ func run() error {
 	ansibleHost := flag.String("host", "", "Ansible 官方单机查询 Hook")
 	flag.Parse()
 
+	if showVersion {
+		fmt.Printf("sshtui %s\n", strings.TrimSpace(version))
+		return nil
+	}
 	if *path {
 		cfgPath, err := getConfigPath()
 		if err == nil {
