@@ -27,5 +27,9 @@ check:
 # Commit VERSION and CHANGELOG.md before publishing an immutable version tag.
 release: check
 	@test -z "$$(git status --porcelain)" || (echo "请先提交所有改动，再发布版本"; exit 1)
-	git tag -a v$(VERSION) -m "sshtui v$(VERSION)"
-	git push --atomic origin HEAD refs/tags/v$(VERSION)
+	@tag=v$(VERSION); \
+	git tag -a "$$tag" -m "sshtui $(VERSION)" || exit; \
+	if ! git push --atomic origin HEAD "refs/tags/$$tag"; then \
+		git tag -d "$$tag" >/dev/null; \
+		exit 1; \
+	fi

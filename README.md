@@ -1,207 +1,233 @@
-# ⚡ sshtui (Ghostty SSH Picker)
+# sshtui
 
-使用 `s --version` 查看本机版本，历史改动见 [CHANGELOG.md](CHANGELOG.md)。
+`sshtui` 是一个面向 macOS 与 Linux 的轻量 SSH 终端选择器。它把主机清单保存在本地 YAML 文件中，提供 TUI 搜索、唯一匹配直连、密码或密钥登录，以及 Ansible 动态清单导出。
 
-专为 **Ghostty** 终端量身定制的轻量、极速 SSH 服务器连接选择器。交互与视觉设计深度契合 **Pi 现代终端美学**，支持密码与密钥双轨登录、实时模糊搜索与单键直连。
+项目默认命令为 `sshtui`，安装后同时创建短命令 `s`。
 
----
+## 特性
 
-## ✨ 核心特性
+- 输入即过滤：按名称、分组、主机和用户搜索，支持键盘选择与滚动视口。
+- 唯一匹配直连：`s dev-app` 可跳过 TUI；多个匹配项会进入已过滤的列表。
+- 原生 SSH 会话：保留窗口缩放、Ctrl+C、退出码和交互式终端行为。
+- 密钥与密码认证：优先使用 `sshpass`，缺失时使用 OpenSSH ASKPASS。
+- 凭据保护：密码不进入命令行参数、环境变量或临时脚本。
+- 连接保护：默认 10 秒连接超时、单次尝试和 SSH keepalive。
+- 终端恢复：SSH 退出后恢复 TTY，并关闭远端程序可能遗留的备用屏、鼠标和括号粘贴模式。
+- Ghostty 集成：在支持的 macOS Ghostty 版本中固定标签标题，退出后恢复自动标题。
+- Ansible 集成：同一份 YAML 可导出为动态 JSON 或 INI inventory，也可直接批量执行命令。
 
-- **现代 TUI 质感 & A-z 排序**：基于 Bubble Tea & Lip Gloss 开发，支持打字即搜（实时过滤名称、IP、分组、用户）、上下微调、高亮徽章与视口滚动。全量列表自动按 A-z 字母序排列。
-- **智能秒级直连（Smart Direct-Connect）**：
-  - 敲 `s 备注`（如 `s 爱尔兰` 或 `s dmit`），唯一匹配时**直接跳过 TUI 毫秒直连**！
-  - 匹配多台时（如 `s oracle`），**自动带着筛选词唤起 TUI** 供精准上下选。
-- **立即移交 SSH**：
-  - 选定服务器或唯一匹配后立即启动 SSH；显示蓝色旋转动画与实际等待秒数，没有固定休眠或额外网络预检。SSH 首次输出或开始终端交互后停止动画，不显示虚构的百分比；重定向输出或极窄终端中不播放动画。
-  - 默认连接及初始 SSH 握手超时为 10 秒，只尝试一次；服务器不可达或握手无响应时显示 SSH 错误并退回本地终端。此超时不限制正常登录后的会话时长。
-- **密码 & 密钥双轨支持**：
-  - 密钥登录：直接调用原生 SSH。
-  - 密码登录：优先使用 `sshpass`，未安装时使用 OpenSSH 自带的 ASKPASS 机制（自动填密需要 OpenSSH 8.4+）。密码通过私有描述符或本地私有 Unix socket 传递，不放入命令行参数、环境变量或脚本。
-  - 自动填密只响应 SSH 本身的认证请求；登录后的远端程序输出 `password:` 不会触发代填。
-- **保留原生终端交互**：
-  - SSH 直接读取用户终端，输出实时转发，支持窗口缩放、Ctrl+C 和退出码传递。显示连接动画或固定 Ghostty 标签时，程序等待 SSH 退出以完成清理；非交互情况下密钥和 sshpass 路径通过 `syscall.Exec` 移交进程。
-  - 窄分屏自动使用紧凑布局；极小窗口提示放大，避免看不到目标时误连接。
-- **服务器备注标签**：
-  - 在 macOS Ghostty 1.3.1+ 中连接时，标签自动固定为服务器的 `name`（未填写时显示 `host`）；远端 shell 修改用户名或目录标题不会覆盖标签。
-  - SSH 退出或连接失败后清除固定标题，恢复自动标题。通过 Ghostty 内置 AppleScript 接口完成，无需修改远端服务器或全局配置；首次使用时 macOS 可能提示自动化授权。接口不可用时提示错误并继续连接；tmux 中跳过此功能。
-- **内置 Ghostty 乱码修复**：
-  - Ghostty 默认传递 `TERM=xterm-ghostty`，在多数未装该 terminfo 的远程 Linux 上会导致 oh-my-zsh 提示符变 `?➜` 以及命令字符重叠。
-  - 本工具在连接前自动将 TERM 重写为工业通用的 `xterm-256color`，从底层彻底解决远程乱码与光标错位。
-- **自动心跳防卡死（KeepAlive & Auto-Timeout）**：
-  - 默认开启客户端保活心跳（每 30 秒探测一次），防止中间 NAT 网关或云厂商路由器静默断开空闲 TCP 连接导致窗口死锁。
-  - 连续 3 次心跳无应答（如笔记本休眠合盖）时，客户端 90 秒内自动优雅断开退回本地终端，彻底告别强关窗口。
-- **极净退出机制（AltScreen）**：
-  - 运行于终端备用缓冲屏，回车连接或退出时瞬间恢复干净的原生终端，不污染命令行历史缓冲区。
-- **单一二进制**：
-  - 不需要 Node.js、Python 或外部守护进程；连接和批量执行分别使用下文列出的系统命令。
+## 运行要求
 
----
+- macOS 或 Linux。
+- `ssh`，通常由系统自带。
+- `sshpass`：可选；未安装时，密码自动填入需要 OpenSSH 8.4 或更新版本。
+- `ansible`：仅批量执行和 inventory 验证需要。
+- Go 1.27 或更新版本：仅从源码构建需要。
 
-## 🚀 快速使用
-
-安装后系统已内置全局超短别名 `s`：
-
-| 命令 | 说明 |
-| :--- | :--- |
-| **`s`** | **唤出 TUI 选择器**（支持实时打字过滤、上下方向键移动、回车连接） |
-| `s --version` / `s -v` | 查看当前安装版本 |
-| **`s 爱尔兰`** | **智能直连**：输入唯一备注或关键字（如 `s dmit`、`s 大阪`）**直接秒级连接，跳过 TUI**！ |
-| `s oracle` | 关键字匹配到多台时，**自动带着该关键词唤起 TUI 筛选列表**供快速上下选 |
-| **`s run "uptime"`** | **通过 Ansible 在所有已配置机器上执行命令** |
-| `s run -g Prod "df -h"` | 只对特定分组（如 `Prod`）的所有机器并发执行命令 |
-| **`s -e`** | **快速打开配置文件**（调用默认编辑器 `$EDITOR` 或 vim 编辑 `servers.yaml`） |
-| `s -l` | 纯文本表格快速打印所有已配置的服务器列表（已按 A-z 字母序排列） |
-| `s -p` | 打印当前使用的配置文件绝对路径 |
-| **`s --ansible`** | 输出 Ansible Dynamic Inventory JSON 格式 |
-| `s --ansible-ini` | 输出 Ansible 标准 INI 清单格式 |
-
----
-
-## 🛠️ 配置文件说明
-
-配置文件默认保存在：  
-📁 **`~/.config/sshtui/servers.yaml`**（首次加载或编辑时自动生成模板；读取及编辑完成后检查权限并收紧为 `0600`）。
-
-也可以保存在 `~/.ssh/servers.yaml`（程序会自动探测）。
-
-`s -e` 和 `s -p` 不要求 YAML 能解析，因此配置写坏后仍可编辑或查看路径。`EDITOR` 支持参数和带引号的路径，例如 `code --wait`；不执行 shell 表达式。
-
-### 配置格式示例
-
-```yaml
-# ==============================================================================
-# sshtui server configuration
-# Path: ~/.config/sshtui/servers.yaml (keep mode 0600)
-# ==============================================================================
-
-# Server entries inherit omitted values from these defaults.
-default:
-  user: root
-  port: 22
-  key: ~/.ssh/id_ed25519
-  server_alive_interval: 30 # Keepalive interval in seconds; defaults to 30.
-  server_alive_count_max: 3  # Disconnect after three unanswered keepalives.
-
-servers:
-  # Password authentication
-  - name: "开发测试机-01"
-    group: "Dev"
-    host: "192.168.1.102"
-    port: 22
-    user: "root"
-    auth: "password"
-    password: "your_password_here"
-
-  # Key authentication
-  - name: "生产主库 (PostgreSQL)"
-    group: "Prod"
-    host: "10.0.0.5"
-    port: 2222
-    user: "admin"
-    auth: "key"
-    key: "~/.ssh/id_ed25519"
-    args: ["-o", "ServerAliveInterval=60"] # Optional native SSH arguments.
-
-  # Minimal entry: inherit user, port and key.
-  - name: "香港日常开发机"
-    group: "Dev"
-    host: "47.242.100.20"
-```
-
-密码可包含引号、美元符号、反斜线和中文；最多 1023 个 UTF-8 字节（OpenSSH 限制），不接受换行及 NUL 字符，避免凭据工具静默截断。`args` 在密钥、sshpass、ASKPASS 和 Ansible 路径中都会保留，显式 `-o` 设置优先于内置默认值。
-
-慢线路可在对应服务器的 `args` 中设置 `['-o', 'ConnectTimeout=30']`，将连接超时调为 30 秒。该超时针对连接及初始握手，不包含 DNS 解析耗时或等待用户输入密码的时间。
-
----
-
-## 🤖 与 Ansible 自动化运维无缝联动
-
-`sshtui` 原生支持将 `servers.yaml` 导出为符合 **Ansible Dynamic Inventory 官方规范** 的资产清单，**一份配置，两处复用**：
-
-### 1. 动态清单直接运行（无需生成任何中间文件）
-```bash
-# Ansible calls s --list to obtain the dynamic inventory.
-ansible all -i "$(command -v s)" -m shell -a "df -h"
-
-ansible all -i "$(command -v s)" -m ping
-
-# Run only on a specific group.
-ansible Prod -i "$(command -v s)" -m shell -a "uptime"
-```
-
-### 2. 导出为静态 INI 主机清单
-```bash
-# Inventories may contain passwords; restrict output permissions.
-(umask 077; s --ansible-ini > hosts.ini)
-
-# Run a playbook.
-ansible-playbook -i hosts.ini my_playbook.yml
-```
-
-> **参数自动映射说明**：
-> - 密钥登录自动映射为 `ansible_ssh_private_key_file`
-> - 密码登录自动映射为 `ansible_password` & `ansible_ssh_pass`
-> - 自动注入 `-o StrictHostKeyChecking=accept-new`、10 秒连接超时、单次连接尝试与心跳保活默认值，允许通过 `args` 覆盖。
-> - 主机名称（空名称使用 host）必须唯一；冲突时拒绝导出，避免把命令发往错误机器。`all` 和 `_meta` 为保留分组名。
-> - INI 支持带空格的名称和含引号的密码；主机别名含 `[]`、冒号或换行时请改用动态 JSON 清单。
-
----
-
-## 👻 Ghostty 进阶联动技巧
-
-### 1. 配置专属快捷键（右侧分屏一键唤出）
-编辑你的 Ghostty 配置文件 `~/.config/ghostty/config`：
-
-```ini
-# Open a split to the right with Cmd+Shift+S.
-keybind = super+shift+s=new_split:right
-```
-
-### 2. 服务器备注标签与全局 TERM
-
-在 macOS Ghostty 1.3.1+ 内运行 `s`，选择服务器后标签会自动显示 `servers.yaml` 中的 `name`，例如「Oracle-大阪」。正常退出、连接超时或认证失败后恢复自动标题。分屏共享同一个标签，标签显示最近通过 `s` 连接的服务器备注；各连接退出时会清除该标签的固定标题。
-
-如果你日常也有手动敲原生 `ssh` 的习惯，建议在 `~/.config/ghostty/config` 中加入：
-```ini
-term = xterm-256color
-```
-确保所有终端连接均使用兼容性最好的终端定义。
-
----
-
-## 📦 编译与重新安装
-
-本项目源码存放于：`~/sshtui`。如果后续想自行修改界面颜色、字段或增加功能，可以随时编译：
+## 安装
 
 ```bash
-cd ~/sshtui
-
-# Build and install ~/.local/bin/sshtui and ~/.local/bin/s.
+git clone https://github.com/onsraorg/sshtui.git
+cd sshtui
 make install
 ```
 
-验证修复和回归行为：
+默认安装到 `~/.local/bin/sshtui`，并创建 `~/.local/bin/s` 软链接。请确保 `~/.local/bin` 已加入 `PATH`。
+
+只构建当前目录中的二进制：
+
+```bash
+make build
+```
+
+## 快速开始
+
+首次执行 `s` 或 `s -e` 时，程序会创建：
+
+```text
+~/.config/sshtui/servers.yaml
+```
+
+如果该文件不存在，程序也会查找 `~/.ssh/servers.yaml`。配置文件必须是普通文件，权限会收紧为 `0600`。
+
+打开配置：
+
+```bash
+s -e
+```
+
+启动选择器：
+
+```bash
+s
+```
+
+直接连接唯一匹配项：
+
+```bash
+s dev-app
+```
+
+## 命令
+
+| 命令 | 说明 |
+| --- | --- |
+| `s` | 打开交互式服务器选择器 |
+| `s <筛选词>` | 唯一名称匹配时直连，否则打开过滤后的列表 |
+| `s -e` | 使用 `$EDITOR` 或 `vim` 编辑配置 |
+| `s -l` | 以纯文本列出服务器 |
+| `s -p` | 输出当前配置文件路径 |
+| `s --version` / `s -v` | 输出版本 |
+| `s --ansible` | 输出 Ansible 动态 JSON inventory |
+| `s --ansible-ini` | 输出 Ansible INI inventory |
+| `s run "uptime"` | 在全部服务器执行命令 |
+| `s run -g production "df -h"` | 在指定分组执行命令 |
+
+筛选词包含空格时必须使用引号，例如 `s "prod db"`。多余的位置参数会被拒绝，避免静默连接错误主机。
+
+## 配置
+
+```yaml
+default:
+  user: deploy
+  port: 22
+  key: ~/.ssh/id_ed25519
+  server_alive_interval: 30
+  server_alive_count_max: 3
+
+servers:
+  - name: dev-app
+    group: development
+    host: 192.0.2.10
+
+  - name: staging-api
+    group: staging
+    host: 198.51.100.20
+    auth: password
+    password: your_password_here
+
+  - name: prod-db
+    group: production
+    host: 203.0.113.30
+    port: 2222
+    user: dbadmin
+    auth: key
+    key: ~/.ssh/prod_ed25519
+    args: ["-J", "bastion.example.com"]
+```
+
+示例使用 RFC 5737 文档专用地址，不代表真实服务器。
+
+### 字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `name` | 显示名称，也是 Ansible 主机别名；建议保持唯一 |
+| `group` | TUI 和 Ansible 分组，默认 `Default` |
+| `host` | SSH 主机名或地址，必填 |
+| `port` | SSH 端口，默认 `22` |
+| `user` | SSH 用户，默认继承 `default.user`，最终回退为 `root` |
+| `auth` | `key` 或 `password`；省略时根据是否存在 `password` 推断 |
+| `key` | 私钥路径，支持 `~/`，可继承 `default.key` |
+| `password` | 密码认证使用的本地明文凭据 |
+| `args` | 额外的原生 SSH 参数，放在内置默认参数之前 |
+
+未知字段、无效端口、无效认证类型和显示字段中的控制字符都会被拒绝。密码最多 1023 个 UTF-8 字节，不能包含 NUL、回车或换行。
+
+`args` 是受信任配置，可以改变 SSH 行为，也可以通过 `ProxyCommand` 启动本地程序。不要使用来源不明的配置文件。
+
+## SSH 行为
+
+程序会追加以下默认选项：
+
+```text
+StrictHostKeyChecking=accept-new
+ConnectTimeout=10
+ConnectionAttempts=1
+ServerAliveInterval=30
+ServerAliveCountMax=3
+TCPKeepAlive=yes
+```
+
+服务器自己的 `args` 位于这些默认值之前。OpenSSH 对相关选项采用第一个值，因此可按服务器覆盖默认值：
+
+```yaml
+args: ["-o", "ConnectTimeout=30"]
+```
+
+连接时 `TERM` 会设置为 `xterm-256color`，避免远端缺少 `xterm-ghostty` terminfo 时出现提示符或光标错位。
+
+## 密码认证
+
+密码认证按以下顺序选择后端：
+
+1. 已安装 `sshpass`：通过私有文件描述符传递密码。
+2. 未安装 `sshpass`：通过权限为 `0700` 的临时目录和本地 Unix socket 提供 ASKPASS。
+
+ASKPASS 只回答 SSH 的密码提示，不回答主机确认或私钥 passphrase，也不会在登录后的远端程序再次显示 `password:` 时自动输入。
+
+配置文件和导出的 inventory 可能包含明文密码。不要提交 `servers.yaml`，导出 INI 时应限制权限：
+
+```bash
+(umask 077; s --ansible-ini > hosts.ini)
+```
+
+## Ansible
+
+直接把程序作为动态 inventory：
+
+```bash
+ansible all -i "$(command -v s)" -m ping
+ansible production -i "$(command -v s)" -m shell -a "uptime"
+```
+
+批量执行的快捷形式：
+
+```bash
+s run "uptime"
+s run -g production "df -h"
+```
+
+主机名称必须唯一。`all` 和 `_meta` 是保留分组名。INI 主机名不能包含 `[]`、冒号或换行；遇到这类名称请使用动态 JSON inventory。
+
+## Ghostty
+
+在 macOS Ghostty 1.3.1 或更新版本中，连接期间标签会固定为服务器 `name`，空名称则使用 `host`。SSH 退出或连接失败后恢复自动标题。
+
+此功能使用 Ghostty 的 AppleScript 接口。macOS 首次调用时可能请求自动化权限；接口不可用时会显示错误并继续连接。tmux 中不会修改 Ghostty 标签。
+
+若希望所有手动 SSH 会话也使用兼容终端定义，可在 Ghostty 配置中加入：
+
+```ini
+term = xterm-256color
+```
+
+## 开发
 
 ```bash
 go test ./...
+go test -race ./...
 go vet ./...
+git diff --check
 ```
 
-测试通过本地替身验证 SSH 调用，并用系统 SSH 连接本机无响应端口验证握手超时，不连接外部服务器。安装 `expect` 和 `ansible-inventory` 后，会额外检查终端交互和 INI 清单往返；`expect` 仅用作测试终端驱动。缺少对应工具时相关集成测试会跳过。
+测试使用本地替身，不连接真实远端主机。安装 `expect`、`sshpass` 和 `ansible-inventory` 后，会覆盖伪终端交互、两种密码后端、Ghostty 标题以及 inventory 往返。
 
-### 版本与发布
+面向用户的行为变更必须同步更新 `VERSION` 和 `CHANGELOG.md`。维护者发布版本时，在提交后执行：
 
-`VERSION` 是版本号的唯一来源，编译时嵌入二进制。每次功能增加更新次版本号，兼容性修复更新补丁版本号，不兼容变更更新主版本号；同时在 `CHANGELOG.md` 记录变更。
+```bash
+make release
+```
 
-更新代码、`VERSION` 和更新记录后，提交到 Git，再运行 `make release`。该命令执行测试、静态检查和差异检查，要求工作区干净，随后创建 `vX.Y.Z` 标签，并将当前提交和该标签原子推送到 `origin`。已有版本标签不能重复创建。
+该目标会重新运行测试与静态检查，要求工作区干净，创建对应的 `vX.Y.Z` 标签，并原子推送提交和标签。推送失败时只删除本次尚未发布的本地标签，便于安全重试。
 
----
+## 贡献
 
-## 📋 依赖要求
+欢迎提交问题和 Pull Request。提交前请：
 
-- **操作系统**：macOS (Apple Silicon / Intel) 或 Linux
-- **依赖命令**：
-  - `ssh`（系统自带；未安装 sshpass 时，自动填密需要 OpenSSH 8.4+）
-  - `sshpass`（可选的密码代填工具，macOS 可通过 `brew install hudochenkov/sshpass/sshpass` 安装）
-  - `ansible`（仅 `s run` 等批量运维命令需要）
+1. 说明可复现的输入、实际结果与预期结果。
+2. 为行为修改添加一个能防止回归的测试。
+3. 运行开发章节中的检查。
+4. 不要提交真实主机、用户名、密码、私钥或 inventory 输出。
+
+报告安全问题时，请勿在公开 issue 中附带真实凭据或服务器地址。

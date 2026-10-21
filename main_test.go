@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -85,6 +86,10 @@ func TestMain(m *testing.M) {
 				time.Sleep(300 * time.Millisecond)
 				if _, err := term.MakeRaw(int(os.Stdin.Fd())); err != nil {
 					panic(err)
+				}
+				if mode == "dirty" {
+					fmt.Print("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?2004h")
+					os.Exit(0)
 				}
 				reader := bufio.NewReader(os.Stdin)
 				if mode == "password" {
@@ -232,6 +237,35 @@ func TestConfigPermissionsAndDefaults(t *testing.T) {
 	}
 }
 
+func TestDefaultConfigCreationIsConcurrentSafe(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".config", "sshtui", "servers.yaml")
+	var wg sync.WaitGroup
+	errs := make(chan error, 16)
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- createDefaultConfig(path)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	var cfg Config
+	if err := yaml.NewDecoder(f).Decode(&cfg); err != nil || len(cfg.Servers) != 3 {
+		t.Fatalf("default config is incomplete: servers=%d, err=%v", len(cfg.Servers), err)
+	}
+}
+
 func TestVersionWorksWithoutValidConfig(t *testing.T) {
 	home, _ := configFixture(t, "servers: [broken\n")
 	for _, arg := range []string{"--version", "-v"} {
@@ -250,6 +284,22 @@ func TestConfigRejectsUnusableCredentials(t *testing.T) {
 			t.Setenv("HOME", home)
 			if _, _, err := loadConfig(); err == nil {
 				t.Fatal("invalid credential was accepted")
+			}
+		})
+	}
+}
+
+func TestConfigRejectsUnknownAndControlFields(t *testing.T) {
+	control, _ := yaml.Marshal(Config{Servers: []ServerConfig{{Name: "node\x1b]52;c;bad\a", Host: "192.0.2.1"}}})
+	for name, contents := range map[string]string{
+		"unknown": "servers:\n  - {name: node, host: 192.0.2.1, uesr: deploy}\n",
+		"control": string(control),
+	} {
+		t.Run(name, func(t *testing.T) {
+			home, _ := configFixture(t, contents)
+			t.Setenv("HOME", home)
+			if _, _, err := loadConfig(); err == nil {
+				t.Fatal("unsafe config was accepted")
 			}
 		})
 	}
@@ -345,7 +395,7 @@ func TestInventoryINIRoundTrip(t *testing.T) {
 	cfg := &Config{}
 	cfg.Default.ServerAliveInterval, cfg.Default.ServerAliveCountMax = 30, 3
 	for i, password := range []string{`ab"cd`, `a'b\c $[x];#`, "12345", "True", "None", "中文🔑"} {
-		cfg.Servers = append(cfg.Servers, ServerConfig{Name: fmt.Sprintf("生产主库 (%d)", i), Host: "192.0.2.1", Group: "Prod", User: "root", Port: 22, Auth: "password", Password: password, Args: []string{"-J", "jump", "-o", "ProxyCommand=ssh -W %h:%p jump"}})
+		cfg.Servers = append(cfg.Servers, ServerConfig{Name: fmt.Sprintf("password-node-%d", i), Host: "192.0.2.1", Group: "production", User: "root", Port: 22, Auth: "password", Password: password, Args: []string{"-J", "jump", "-o", "ProxyCommand=ssh -W %h:%p jump"}})
 	}
 	cfg.Servers = append(cfg.Servers, ServerConfig{Name: "key node", Host: "192.0.2.2", Group: "Dev", User: "admin", Port: 2222, Auth: "key", Key: filepath.Join(t.TempDir(), `key 'with spaces'`)})
 	ini, err := generateAnsibleINI(cfg)
@@ -492,6 +542,14 @@ func TestDirectMatch(t *testing.T) {
 	}
 }
 
+func TestExtraFilterArgumentsAreRejected(t *testing.T) {
+	home, _ := configFixture(t, "servers:\n  - {name: prod, host: 192.0.2.1}\n  - {name: 'prod db', host: 192.0.2.2}\n")
+	out, err := cliCommand(t, map[string]string{"HOME": home}, "prod", "db").CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "名称含空格时请使用引号") {
+		t.Fatalf("extra filter argument was ignored: %v; output: %s", err, out)
+	}
+}
+
 func TestViewFitsWindowAndKeepsSelectionVisible(t *testing.T) {
 	cfg := &Config{}
 	for i := 0; i < 30; i++ {
@@ -603,6 +661,53 @@ exit [lindex $result 3]
 	}
 }
 
+func TestSSHRestoresTerminalAfterDirtyChild(t *testing.T) {
+	expect, err := exec.LookPath("expect")
+	if err != nil {
+		t.Skip("expect is not installed")
+	}
+	for _, redirect := range []bool{false, true} {
+		t.Run(fmt.Sprintf("redirect-stderr=%t", redirect), func(t *testing.T) {
+			home, _ := configFixture(t, "servers:\n  - {name: node, host: 192.0.2.1, auth: key}\n")
+			bin := t.TempDir()
+			binary, _ := os.Executable()
+			linkHelper(t, bin, "ssh", binary)
+			stty, err := exec.LookPath("stty")
+			if err != nil {
+				t.Fatal(err)
+			}
+			linkHelper(t, bin, "stty", stty)
+			driver := `
+set timeout 4
+spawn -noecho /bin/sh -c {if [ "$SSHTUI_TEST_REDIRECT" = 1 ]; then "$SSHTUI_TEST_BINARY" node 2>"$SSHTUI_TEST_STDERR"; else "$SSHTUI_TEST_BINARY" node; fi; state=$(stty -a); case " $state " in *" -icanon "*|*" -echo "*) exit 102;; esac}
+expect {
+    eof {}
+    timeout { puts stderr "SSH did not exit"; exit 101 }
+}
+set result [wait]
+exit [lindex $result 3]
+`
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, expect, "-c", driver)
+			env := map[string]string{"HOME": home, "PATH": bin, "TERM": "xterm-256color", "SSHTUI_TEST_PROCESS": "1", "SSHTUI_TEST_BINARY": binary, "SSHTUI_TEST_LOG": filepath.Join(t.TempDir(), "log"), "SSHTUI_TEST_SESSION": "dirty", "SSHTUI_TEST_STDERR": filepath.Join(t.TempDir(), "stderr")}
+			if redirect {
+				env["SSHTUI_TEST_REDIRECT"] = "1"
+			}
+			cmd.Env = testEnv(env)
+			out, err := cmd.CombinedOutput()
+			if ctx.Err() != nil || err != nil {
+				t.Fatalf("dirty SSH terminal cleanup: %v; output: %q", err, out)
+			}
+			for _, sequence := range []string{"\x1b[?1049l", "\x1b[?1000l", "\x1b[?1006l", "\x1b[?2004l"} {
+				if !strings.Contains(string(out), sequence) {
+					t.Errorf("terminal cleanup missing %q: %q", sequence, out)
+				}
+			}
+		})
+	}
+}
+
 func TestPasswordHelperInteractiveSession(t *testing.T) {
 	expect, err := exec.LookPath("expect")
 	if err != nil {
@@ -632,7 +737,7 @@ func TestPasswordHelperInteractiveSession(t *testing.T) {
 				cfg.Servers[0].Auth = "key"
 			}
 			if tc.ghostty {
-				cfg.Servers[0].Name = "node 大阪 \"引号\" \\路径\x07\x1b"
+				cfg.Servers[0].Name = "node 测试 \"引号\" \\路径"
 			}
 			data, _ := yaml.Marshal(cfg)
 			home, _ := configFixture(t, string(data))
@@ -741,12 +846,15 @@ exit [lindex $result 3]
 			}
 			if tc.ghostty {
 				set := readRecord[[]string](t, log+".title-set")
-				if len(set) != 2 || !strings.HasPrefix(set[0], "sshtui-") || set[1] != "node 大阪 \"引号\" \\路径" {
+				if len(set) != 2 || !strings.HasPrefix(set[0], "sshtui-") || set[1] != "node 测试 \"引号\" \\路径" {
 					t.Fatalf("server remark was not safely passed as title: %q", set)
 				}
 				if tc.titleFailure {
 					if !strings.Contains(string(out), "设置 Ghostty 标签标题失败，继续连接") {
 						t.Fatalf("missing title failure message: %s", out)
+					}
+					if !strings.Contains(string(out), "\x1b]2;\x1b\\") {
+						t.Fatalf("failed title setup was not cleared: %q", out)
 					}
 				} else if reset := readRecord[[]string](t, log+".title-reset"); !slices.Equal(reset, []string{"test-terminal-id"}) {
 					t.Fatalf("title reset did not target the original terminal: %q", reset)

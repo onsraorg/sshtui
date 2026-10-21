@@ -110,39 +110,44 @@ default:
   server_alive_count_max: 3
 
 servers:
-  - name: "开发环境-应用服务"
-    group: "Dev"
-    host: "192.168.1.101"
-    port: 22
-    user: "ubuntu"
+  - name: "dev-app"
+    group: "development"
+    host: "192.0.2.10"
+    user: "deploy"
     auth: "key"
     key: "~/.ssh/id_ed25519"
 
-  - name: "测试集群-API网关"
-    group: "Test"
-    host: "192.168.1.102"
-    port: 22
-    user: "root"
+  - name: "staging-api"
+    group: "staging"
+    host: "198.51.100.20"
+    user: "deploy"
     auth: "password"
     password: "your_password_here"
 
-  - name: "生产主库 (PostgreSQL)"
-    group: "Prod"
-    host: "10.0.0.5"
+  - name: "prod-db"
+    group: "production"
+    host: "203.0.113.30"
     port: 2222
-    user: "admin"
+    user: "dbadmin"
     auth: "key"
     key: "~/.ssh/id_ed25519"
 `
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if os.IsExist(err) {
-		return nil // Another process created it; never overwrite an existing config.
-	}
+	f, err := os.CreateTemp(dir, ".servers.yaml-*")
 	if err != nil {
 		return err
 	}
-	_, err = io.WriteString(f, sample)
-	return errors.Join(err, f.Close())
+	defer os.Remove(f.Name())
+	if _, err := io.WriteString(f, sample); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Link(f.Name(), path); err != nil && !os.IsExist(err) {
+		return err
+	}
+	return nil
 }
 
 // Check permissions on the descriptor that will be read to avoid path races.
@@ -189,13 +194,10 @@ func loadConfig() (*Config, string, error) {
 		return nil, "", err
 	}
 	defer f.Close()
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return nil, "", fmt.Errorf("读取配置文件失败: %w", err)
-	}
-
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	decoder := yaml.NewDecoder(f)
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
 		return nil, "", fmt.Errorf("解析 YAML 配置文件失败: %w", err)
 	}
 
@@ -231,6 +233,11 @@ func loadConfig() (*Config, string, error) {
 		for _, field := range fields {
 			if strings.ContainsRune(field, 0) {
 				return nil, "", fmt.Errorf("服务器 %q 的配置不能包含 NUL 字符", s.Name)
+			}
+		}
+		for _, field := range []string{s.Name, s.Group, s.Host, s.User} {
+			if strings.IndexFunc(field, unicode.IsControl) >= 0 {
+				return nil, "", fmt.Errorf("服务器 %q 的显示字段不能包含控制字符", s.Name)
 			}
 		}
 		if err := validatePassword(s.Password); err != nil {
@@ -585,6 +592,11 @@ func runWithAskpass(sshPath string, args []string, password string, env []string
 
 func runSSH(cmd *exec.Cmd) error {
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	var terminalState *term.State
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		terminalState, _ = term.GetState(int(os.Stdin.Fd()))
+	}
+	defer restoreTerminal(terminalState)
 	if progress := startConnectionProgress(); progress != nil {
 		defer progress.stop(true)
 		cmd.Stdout = connectionOutput{progress, os.Stdout}
@@ -681,6 +693,25 @@ func (w connectionOutput) Write(data []byte) (int, error) {
 	return w.output.Write(data)
 }
 
+const terminalCleanup = "\x1b[?2026l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[>4;0m\x1b[<u\x1b[0m\x1b[?25h\x1b[?1049l"
+
+func restoreTerminal(state *term.State) {
+	if state == nil {
+		return
+	}
+	_ = term.Restore(int(os.Stdin.Fd()), state)
+	output := os.Stderr
+	if !term.IsTerminal(int(output.Fd())) {
+		var err error
+		output, err = os.OpenFile("/dev/tty", os.O_WRONLY, 0)
+		if err != nil {
+			return
+		}
+		defer output.Close()
+	}
+	fmt.Fprint(output, terminalCleanup)
+}
+
 func ghosttyScript(script string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -726,12 +757,13 @@ func pinGhosttyTabTitle(s *ServerConfig) func() {
 		error "Cannot find current Ghostty terminal"
 	end tell
 end run`, marker, title)
-	_, _ = fmt.Fprintf(tty, "\x1b]2;%s\x1b\\", title)
 	if err != nil {
+		_, _ = fmt.Fprint(tty, "\x1b]2;\x1b\\")
 		tty.Close()
 		fmt.Fprintf(os.Stderr, "设置 Ghostty 标签标题失败，继续连接: %v\n", err)
 		return nil
 	}
+	_, _ = fmt.Fprintf(tty, "\x1b]2;%s\x1b\\", title)
 	return func() {
 		defer tty.Close()
 		_, err := ghosttyScript(`on run argv
@@ -790,7 +822,7 @@ func connectToServer(s *ServerConfig, cfg *Config) error {
 		defer restoreTitle()
 	}
 	if s.Auth != "password" {
-		if restoreTitle != nil || (term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stderr.Fd()))) {
+		if restoreTitle != nil || term.IsTerminal(int(os.Stdin.Fd())) {
 			cmd := exec.Command(sshPath, args...)
 			cmd.Env = env
 			return runSSH(cmd)
@@ -807,7 +839,7 @@ func connectToServer(s *ServerConfig, cfg *Config) error {
 		return fmt.Errorf("准备密码描述符失败: %w", err)
 	}
 	defer input.Close()
-	if restoreTitle != nil || (term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stderr.Fd()))) {
+	if restoreTitle != nil || term.IsTerminal(int(os.Stdin.Fd())) {
 		cmd := exec.Command(helper, append([]string{"-d", "3", sshPath}, args...)...)
 		cmd.Env, cmd.ExtraFiles = env, []*os.File{input}
 		return runSSH(cmd)
@@ -1134,6 +1166,9 @@ func run() error {
 		return nil
 	}
 
+	if flag.NArg() > 1 {
+		return fmt.Errorf("服务器筛选词只能是一个参数；名称含空格时请使用引号")
+	}
 	filter := strings.TrimSpace(flag.Arg(0))
 	if filter != "" {
 		if target := directMatch(cfg.Servers, filter); target != nil {
