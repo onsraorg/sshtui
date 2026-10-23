@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -87,8 +88,12 @@ func TestMain(m *testing.M) {
 				if _, err := term.MakeRaw(int(os.Stdin.Fd())); err != nil {
 					panic(err)
 				}
-				if mode == "dirty" {
-					fmt.Print("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?2004h")
+				if strings.HasPrefix(mode, "dirty") {
+					fmt.Print("\x1b[>7u\x1b[>7u")
+					if mode == "dirty" {
+						fmt.Print("\x1b[?1049h\x1b[>7u\x1b[>7u")
+					}
+					fmt.Print("\x1b[?1000h\x1b[?1006h\x1b[?2004h")
 					os.Exit(0)
 				}
 				reader := bufio.NewReader(os.Stdin)
@@ -666,8 +671,11 @@ func TestSSHRestoresTerminalAfterDirtyChild(t *testing.T) {
 	if err != nil {
 		t.Skip("expect is not installed")
 	}
-	for _, redirect := range []bool{false, true} {
-		t.Run(fmt.Sprintf("redirect-stderr=%t", redirect), func(t *testing.T) {
+	for _, tc := range []struct {
+		mode     string
+		redirect bool
+	}{{"dirty", false}, {"dirty", true}, {"dirty-main", false}, {"dirty-main", true}} {
+		t.Run(fmt.Sprintf("%s/redirect-stderr=%t", tc.mode, tc.redirect), func(t *testing.T) {
 			home, _ := configFixture(t, "servers:\n  - {name: node, host: 192.0.2.1, auth: key}\n")
 			bin := t.TempDir()
 			binary, _ := os.Executable()
@@ -690,8 +698,8 @@ exit [lindex $result 3]
 			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 			defer cancel()
 			cmd := exec.CommandContext(ctx, expect, "-c", driver)
-			env := map[string]string{"HOME": home, "PATH": bin, "TERM": "xterm-256color", "SSHTUI_TEST_PROCESS": "1", "SSHTUI_TEST_BINARY": binary, "SSHTUI_TEST_LOG": filepath.Join(t.TempDir(), "log"), "SSHTUI_TEST_SESSION": "dirty", "SSHTUI_TEST_STDERR": filepath.Join(t.TempDir(), "stderr")}
-			if redirect {
+			env := map[string]string{"HOME": home, "PATH": bin, "TERM": "xterm-256color", "SSHTUI_TEST_PROCESS": "1", "SSHTUI_TEST_BINARY": binary, "SSHTUI_TEST_LOG": filepath.Join(t.TempDir(), "log"), "SSHTUI_TEST_SESSION": tc.mode, "SSHTUI_TEST_STDERR": filepath.Join(t.TempDir(), "stderr")}
+			if tc.redirect {
 				env["SSHTUI_TEST_REDIRECT"] = "1"
 			}
 			cmd.Env = testEnv(env)
@@ -703,6 +711,38 @@ exit [lindex $result 3]
 				if !strings.Contains(string(out), sequence) {
 					t.Errorf("terminal cleanup missing %q: %q", sequence, out)
 				}
+			}
+			// Interpret the actual output using Kitty's independent per-screen stacks.
+			stacks := [2][]int{{0}, {0}}
+			screen := 0
+			for _, sequence := range regexp.MustCompile(`\x1b\[([<>?]?)([0-9]*)([uhl])`).FindAllStringSubmatch(string(out), -1) {
+				prefix, parameter, action := sequence[1], sequence[2], sequence[3]
+				if prefix == "?" && parameter == "1049" {
+					if action == "h" {
+						screen = 1
+					} else if action == "l" {
+						screen = 0
+					}
+				} else if action == "u" {
+					n, _ := strconv.Atoi(parameter)
+					switch prefix {
+					case ">":
+						stacks[screen] = append(stacks[screen], n)
+					case "<":
+						if parameter == "" {
+							n = 1
+						}
+						depth := len(stacks[screen]) - n
+						if depth <= 0 {
+							stacks[screen] = []int{0}
+						} else {
+							stacks[screen] = stacks[screen][:depth]
+						}
+					}
+				}
+			}
+			if screen != 0 || !slices.Equal(stacks[0], []int{0}) || !slices.Equal(stacks[1], []int{0}) {
+				t.Errorf("keyboard mode left active after SSH: screen=%d stacks=%v", screen, stacks)
 			}
 		})
 	}
