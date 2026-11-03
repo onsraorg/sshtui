@@ -939,3 +939,115 @@ func TestPasswordPipe(t *testing.T) {
 		t.Fatal("overlong password must be rejected rather than truncated")
 	}
 }
+
+func TestParseServerArgs(t *testing.T) {
+	cases := []struct {
+		args     []string
+		wantUser string
+		wantHost string
+		wantPort int
+		wantAuth string
+		wantPass string
+		wantKey  string
+		wantName string
+	}{
+		{
+			args:     []string{"192.168.1.100", "22", "MyPassword123"},
+			wantUser: "root",
+			wantHost: "192.168.1.100",
+			wantPort: 22,
+			wantAuth: "password",
+			wantPass: "MyPassword123",
+			wantName: "192.168.1.100",
+		},
+		{
+			args:     []string{"192.168.1.100", "22", "~/.ssh/my_vps.pem"},
+			wantUser: "root",
+			wantHost: "192.168.1.100",
+			wantPort: 22,
+			wantAuth: "key",
+			wantKey:  "~/.ssh/my_vps.pem",
+			wantName: "192.168.1.100",
+		},
+		{
+			args:     []string{"192.168.1.100", "MyPassword123"},
+			wantUser: "root",
+			wantHost: "192.168.1.100",
+			wantPort: 22,
+			wantAuth: "password",
+			wantPass: "MyPassword123",
+			wantName: "192.168.1.100",
+		},
+		{
+			args:     []string{"ubuntu@1.2.3.4", "22", "MyPassword123", "测试机"},
+			wantUser: "ubuntu",
+			wantHost: "1.2.3.4",
+			wantPort: 22,
+			wantAuth: "password",
+			wantPass: "MyPassword123",
+			wantName: "测试机",
+		},
+		{
+			args:     []string{"root@1.2.3.4:2222", "MyPassword123"},
+			wantUser: "root",
+			wantHost: "1.2.3.4",
+			wantPort: 2222,
+			wantAuth: "password",
+			wantPass: "MyPassword123",
+			wantName: "1.2.3.4:2222",
+		},
+		{
+			args:     []string{"[2001:db8::1]:2222", "MyPassword123"},
+			wantUser: "root",
+			wantHost: "2001:db8::1",
+			wantPort: 2222,
+			wantAuth: "password",
+			wantPass: "MyPassword123",
+			wantName: "[2001:db8::1]:2222",
+		},
+	}
+
+	for _, tc := range cases {
+		s, err := parseServerArgs(tc.args, "root")
+		if err != nil {
+			t.Fatalf("parseServerArgs(%v) failed: %v", tc.args, err)
+		}
+		if s.User != tc.wantUser || s.Host != tc.wantHost || s.Port != tc.wantPort || s.Auth != tc.wantAuth || s.Password != tc.wantPass || s.Key != tc.wantKey || s.Name != tc.wantName {
+			t.Fatalf("parseServerArgs(%v) = %+v, want %+v", tc.args, s, tc)
+		}
+	}
+}
+
+func TestQuickAddServer(t *testing.T) {
+	home, path := configFixture(t, "# header comment\nservers:\n  - {name: old, host: 192.0.2.1}\n")
+	t.Setenv("HOME", home)
+
+	err := quickAddServer([]string{"ubuntu@198.51.100.1", "2222", "secret123", "new-node"})
+	if err != nil {
+		t.Fatalf("quickAddServer failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "# header comment") {
+		t.Fatal("original comments were overwritten")
+	}
+
+	cfg, _, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig failed after quickAddServer: %v", err)
+	}
+	if len(cfg.Servers) != 2 {
+		t.Fatalf("expected 2 servers, got %d", len(cfg.Servers))
+	}
+	added := directMatch(cfg.Servers, "new-node")
+	if added == nil || added.Name != "new-node" || added.User != "ubuntu" || added.Host != "198.51.100.1" || added.Port != 2222 || added.Password != "secret123" || added.Auth != "password" {
+		t.Fatalf("added server mismatch: %+v", added)
+	}
+	info, _ := os.Stat(path)
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("file permissions = %o, want 0600", info.Mode().Perm())
+	}
+}

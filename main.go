@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	_ "embed"
@@ -1066,6 +1067,195 @@ func editConfig() error {
 	}
 	return runErr
 }
+func isKeyPath(s string) bool {
+	if strings.HasPrefix(s, "~/") || strings.HasPrefix(s, "/") || strings.HasPrefix(s, "./") || strings.HasPrefix(s, "../") {
+		return true
+	}
+	lower := strings.ToLower(s)
+	for _, ext := range []string{".pem", ".key", ".pub", ".id_rsa", ".id_ed25519", ".id_ecdsa", ".id_dsa"} {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
+	}
+	expanded := expandPath(s)
+	if info, err := os.Stat(expanded); err == nil && !info.IsDir() {
+		return true
+	}
+	return false
+}
+
+func parseServerArgs(args []string, defaultUser string) (*ServerConfig, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("缺少服务器参数。用法: s -e [user@]host [port] [password|key] [name] [group]")
+	}
+
+	s := &ServerConfig{
+		Group: "Default",
+		User:  cmp.Or(defaultUser, "root"),
+	}
+
+	target := strings.TrimSpace(args[0])
+	if target == "" {
+		return nil, fmt.Errorf("主机地址不能为空")
+	}
+
+	if u, rem, ok := strings.Cut(target, "@"); ok {
+		if u != "" {
+			s.User = u
+		}
+		target = rem
+	}
+
+	if h, p, err := net.SplitHostPort(target); err == nil {
+		s.Host = h
+		if port, err := strconv.Atoi(p); err == nil && port > 0 && port <= 65535 {
+			s.Port = port
+		}
+	} else if idx := strings.LastIndex(target, ":"); idx != -1 && !strings.Contains(target, "]") {
+		if port, err := strconv.Atoi(target[idx+1:]); err == nil && port > 0 && port <= 65535 {
+			s.Port = port
+			s.Host = target[:idx]
+		} else {
+			s.Host = target
+		}
+	} else {
+		s.Host = strings.Trim(target, "[]")
+	}
+
+	if s.Host == "" {
+		return nil, fmt.Errorf("未能解析出有效的主机名或 IP")
+	}
+
+	for _, arg := range args[1:] {
+		arg = strings.TrimSpace(arg)
+		if arg == "" {
+			continue
+		}
+		if n, err := strconv.Atoi(arg); err == nil && n > 0 && n <= 65535 {
+			if s.Port == 0 {
+				s.Port = n
+				continue
+			} else if s.Port == n {
+				continue
+			}
+		}
+		if s.Auth == "" {
+			if isKeyPath(arg) {
+				s.Auth = "key"
+				s.Key = arg
+			} else {
+				s.Auth = "password"
+				s.Password = arg
+			}
+			continue
+		}
+		if s.Name == "" {
+			s.Name = arg
+			continue
+		}
+		if s.Group == "Default" {
+			s.Group = arg
+			continue
+		}
+	}
+
+	if s.Port <= 0 {
+		s.Port = 22
+	}
+	if s.Auth == "" {
+		s.Auth = "key"
+	}
+	if s.Name == "" {
+		if s.Port != 22 {
+			s.Name = net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
+		} else {
+			s.Name = s.Host
+		}
+	}
+
+	return s, nil
+}
+
+func quickAddServer(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("缺少服务器参数。用法: s -e [user@]host [port] [password|key] [name] [group]")
+	}
+	cfg, cfgPath, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	server, err := parseServerArgs(args, cfg.Default.User)
+	if err != nil {
+		return err
+	}
+	if server.Auth == "password" {
+		if err := validatePassword(server.Password); err != nil {
+			return err
+		}
+	}
+
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return fmt.Errorf("读取配置文件失败: %w", err)
+	}
+
+	var entry strings.Builder
+	if !bytes.Contains(raw, []byte("servers:")) {
+		entry.WriteString("\nservers:\n")
+	}
+	entry.WriteString(fmt.Sprintf("\n  - name: %q\n    group: %q\n    host: %q\n    port: %d\n    user: %q\n    auth: %q\n",
+		server.Name, server.Group, server.Host, server.Port, server.User, server.Auth))
+	if server.Auth == "key" {
+		entry.WriteString(fmt.Sprintf("    key: %q\n", server.Key))
+	} else {
+		entry.WriteString(fmt.Sprintf("    password: %q\n", server.Password))
+	}
+
+	updated := bytes.TrimRight(raw, " \t\r\n")
+	updated = append(updated, []byte(entry.String())...)
+	updated = append(updated, '\n')
+
+	var testCfg Config
+	decoder := yaml.NewDecoder(bytes.NewReader(updated))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&testCfg); err != nil {
+		return fmt.Errorf("追加后配置校验失败: %w", err)
+	}
+
+	dir := filepath.Dir(cfgPath)
+	temp, err := os.CreateTemp(dir, "sshtui-servers-*.yaml")
+	if err != nil {
+		return fmt.Errorf("创建临时文件失败: %w", err)
+	}
+	defer os.Remove(temp.Name())
+
+	if _, err := temp.Write(updated); err != nil {
+		temp.Close()
+		return fmt.Errorf("写入临时文件失败: %w", err)
+	}
+	if err := temp.Chmod(0600); err != nil {
+		temp.Close()
+		return fmt.Errorf("设置文件权限失败: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temp.Name(), cfgPath); err != nil {
+		return fmt.Errorf("保存配置文件失败: %w", err)
+	}
+
+	authDesc := "密码认证"
+	if server.Auth == "key" {
+		authDesc = "密钥认证: " + server.Key
+	}
+	fmt.Printf("✓ 已成功将服务器添加到配置文件 (%s)\n", cfgPath)
+	fmt.Printf("  • 名称: %s\n", server.Name)
+	fmt.Printf("  • 分组: %s\n", server.Group)
+	fmt.Printf("  • 目标: %s@%s\n", server.User, net.JoinHostPort(server.Host, strconv.Itoa(server.Port)))
+	fmt.Printf("  • 认证: %s\n", authDesc)
+	return nil
+}
+
 
 func directMatch(servers []ServerConfig, term string) *ServerConfig {
 	var exact, partial *ServerConfig
@@ -1109,8 +1299,12 @@ func run() error {
 		}
 		return runAnsibleCommand(*group, strings.Join(runCmd.Args(), " "))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "add" {
+		return quickAddServer(os.Args[2:])
+	}
 
-	edit := flag.Bool("e", false, "用系统编辑器直接打开配置文件编辑")
+	edit := flag.Bool("e", false, "打开配置文件编辑，或带参数快速添加服务器: s -e [user@]host [port] [password|key]")
+	add := flag.Bool("a", false, "快速添加服务器到配置文件: s -a [user@]host [port] [password|key]")
 	var showVersion bool
 	flag.BoolVar(&showVersion, "version", false, "显示版本号")
 	flag.BoolVar(&showVersion, "v", false, "显示版本号")
@@ -1134,7 +1328,13 @@ func run() error {
 		return err
 	}
 	if *edit {
+		if flag.NArg() > 0 {
+			return quickAddServer(flag.Args())
+		}
 		return editConfig()
+	}
+	if *add {
+		return quickAddServer(flag.Args())
 	}
 	cfg, cfgPath, err := loadConfig()
 	if err != nil {
