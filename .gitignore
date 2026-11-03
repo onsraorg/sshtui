@@ -6,6 +6,8 @@ sshtui
 *.so
 *.dylib
 
+dist/
+
 # Test or temp
 *.out
 *.tmp

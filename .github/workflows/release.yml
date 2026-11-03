@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: true
+
+      - name: Build and Package
+        run: |
+          mkdir -p dist
+          VERSION=$(cat VERSION)
+          PLATFORMS=(
+            "darwin/arm64"
+            "darwin/amd64"
+            "linux/amd64"
+            "linux/arm64"
+          )
+          for p in "${PLATFORMS[@]}"; do
+            GOOS="${p%/*}"
+            GOARCH="${p#*/}"
+            ARCHIVE="dist/sshtui_${VERSION}_${GOOS}_${GOARCH}.tar.gz"
+            echo "Building ${GOOS}/${GOARCH}..."
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w" -o dist/sshtui main.go
+            tar -czf "$ARCHIVE" -C dist sshtui
+            rm -f dist/sshtui
+          done
+          cd dist
+          sha256sum sshtui_*.tar.gz > checksums.txt
+
+      - name: Extract Changelog
+        run: |
+          VERSION=$(cat VERSION)
+          awk -v ver="$VERSION" '
+            $0 ~ "^## " ver { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > dist/notes.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: sshtui ${{ github.ref_name }}
+          body_path: dist/notes.md
+          files: |
+            dist/sshtui_*.tar.gz
+            dist/checksums.txt

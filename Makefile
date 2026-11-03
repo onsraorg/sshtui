@@ -18,6 +18,7 @@ install: build
 
 clean:
 	rm -f $(BINARY_NAME)
+	rm -rf dist
 
 check:
 	go test ./...
