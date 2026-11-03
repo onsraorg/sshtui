@@ -229,7 +229,7 @@ func TestConfigPermissionsAndDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	info, _ := os.Stat(path)
-	if info.Mode().Perm() != 0600 || cfg.Servers[0].User != "root" || cfg.Servers[0].Port != 22 || cfg.Default.ServerAliveInterval != 30 {
+	if info.Mode().Perm() != 0600 || cfg.Servers[0].User != "root" || cfg.Servers[0].Port != 22 || cfg.Default.ServerAliveInterval != 15 {
 		t.Fatalf("permissions/defaults: mode=%o cfg=%+v", info.Mode().Perm(), cfg)
 	}
 	before, _ := os.ReadFile(path)
@@ -475,7 +475,7 @@ func TestSSHOptionsRespectOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"serveraliveinterval 60\n", "stricthostkeychecking true\n", "connecttimeout 25\n", "connectionattempts 2\n", "proxyjump jump\n"} {
+	for _, expected := range []string{"serveraliveinterval 60\n", "stricthostkeychecking true\n", "connecttimeout 25\n", "connectionattempts 2\n", "proxyjump jump\n", "tcpkeepalive no\n", "ipqos none none\n"} {
 		if !strings.Contains(string(out), expected) {
 			t.Errorf("effective options missing %q", expected)
 		}

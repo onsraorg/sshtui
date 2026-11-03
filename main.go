@@ -54,8 +54,8 @@ type Config struct {
 		User                string `yaml:"user"`
 		Port                int    `yaml:"port"`
 		Key                 string `yaml:"key"`
-		ServerAliveInterval int    `yaml:"server_alive_interval"`  // Keepalive interval in seconds; defaults to 30.
-		ServerAliveCountMax int    `yaml:"server_alive_count_max"` // Failed keepalive limit; defaults to 3.
+		ServerAliveInterval int    `yaml:"server_alive_interval"`  // Keepalive interval in seconds; defaults to 15.
+		ServerAliveCountMax int    `yaml:"server_alive_count_max"` // Failed keepalive limit; defaults to 30.
 	} `yaml:"default"`
 	Servers []ServerConfig `yaml:"servers"`
 }
@@ -106,8 +106,8 @@ default:
   user: root
   port: 22
   key: ~/.ssh/id_ed25519
-  server_alive_interval: 30
-  server_alive_count_max: 3
+  server_alive_interval: 15
+  server_alive_count_max: 30
 
 servers:
   - name: "dev-app"
@@ -202,10 +202,10 @@ func loadConfig() (*Config, string, error) {
 	}
 
 	if cfg.Default.ServerAliveInterval <= 0 {
-		cfg.Default.ServerAliveInterval = 30
+		cfg.Default.ServerAliveInterval = 15
 	}
 	if cfg.Default.ServerAliveCountMax <= 0 {
-		cfg.Default.ServerAliveCountMax = 3
+		cfg.Default.ServerAliveCountMax = 30
 	}
 
 	for i := range cfg.Servers {
@@ -515,7 +515,8 @@ func sshOptions(s *ServerConfig, cfg *Config) []string {
 		"-o", "ConnectionAttempts=1",
 		"-o", fmt.Sprintf("ServerAliveInterval=%d", cfg.Default.ServerAliveInterval),
 		"-o", fmt.Sprintf("ServerAliveCountMax=%d", cfg.Default.ServerAliveCountMax),
-		"-o", "TCPKeepAlive=yes")
+		"-o", "TCPKeepAlive=no",
+		"-o", "IPQoS=none")
 }
 
 func validatePassword(password string) error {

@@ -92,8 +92,8 @@ default:
   user: deploy
   port: 22
   key: ~/.ssh/id_ed25519
-  server_alive_interval: 30
-  server_alive_count_max: 3
+  server_alive_interval: 15
+  server_alive_count_max: 30
 
 servers:
   - name: dev-app
@@ -144,10 +144,10 @@ servers:
 StrictHostKeyChecking=accept-new
 ConnectTimeout=10
 ConnectionAttempts=1
-ServerAliveInterval=30
-ServerAliveCountMax=3
-TCPKeepAlive=yes
-```
+ServerAliveInterval=15
+ServerAliveCountMax=30
+TCPKeepAlive=no
+IPQoS=none
 
 服务器自己的 `args` 位于这些默认值之前。OpenSSH 对相关选项采用第一个值，因此可按服务器覆盖默认值：
 
