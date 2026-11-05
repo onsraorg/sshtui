@@ -8,23 +8,38 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
+      # actions/checkout v4.2.2 (https://github.com/actions/checkout/releases/tag/v4.2.2)
       - name: Checkout
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      # actions/setup-go v5.6.0 (https://github.com/actions/setup-go/releases/tag/v5.6.0)
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version: "stable"
           cache: true
 
+      - name: Validate Version and Tag
+        run: |
+          chmod +x ./scripts/read-version.sh
+          VERSION="$(./scripts/read-version.sh VERSION)"
+          EXPECTED_TAG="v${VERSION}"
+          if [ "$GITHUB_REF_NAME" != "$EXPECTED_TAG" ]; then
+            echo "触发标签 '$GITHUB_REF_NAME' 与 VERSION '${VERSION}' (预期: '$EXPECTED_TAG') 不一致" >&2
+            exit 1
+          fi
       - name: Build and Package
         run: |
           mkdir -p dist
-          VERSION=$(cat VERSION)
+          VERSION="$(./scripts/read-version.sh VERSION)"
           PLATFORMS=(
             "darwin/arm64"
             "darwin/amd64"
@@ -36,7 +51,7 @@ jobs:
             GOARCH="${p#*/}"
             ARCHIVE="dist/sshtui_${VERSION}_${GOOS}_${GOARCH}.tar.gz"
             echo "Building ${GOOS}/${GOARCH}..."
-            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w" -o dist/sshtui main.go
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w" -o dist/sshtui .
             tar -czf "$ARCHIVE" -C dist sshtui
             rm -f dist/sshtui
           done
@@ -45,15 +60,13 @@ jobs:
 
       - name: Extract Changelog
         run: |
-          VERSION=$(cat VERSION)
-          awk -v ver="$VERSION" '
-            $0 ~ "^## " ver { found=1; next }
-            found && /^## / { exit }
-            found { print }
-          ' CHANGELOG.md > dist/notes.md
+          VERSION="$(./scripts/read-version.sh VERSION)"
+          chmod +x ./scripts/extract-changelog.sh
+          ./scripts/extract-changelog.sh "$VERSION" CHANGELOG.md dist/notes.md
 
+      # softprops/action-gh-release v2.6.2 (https://github.com/softprops/action-gh-release/releases/tag/v2.6.2)
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           name: sshtui ${{ github.ref_name }}
           body_path: dist/notes.md

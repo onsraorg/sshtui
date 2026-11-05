@@ -9,7 +9,7 @@
 - 输入即过滤：按名称、分组、主机和用户搜索，支持键盘选择与滚动视口。
 - 唯一匹配直连：`s dev-app` 可跳过 TUI；多个匹配项会进入已过滤的列表。
 - 原生 SSH 会话：保留窗口缩放、Ctrl+C、退出码和交互式终端行为。
-- 密钥与密码认证：优先使用 `sshpass`，缺失时使用 OpenSSH ASKPASS。
+- 密钥与密码认证：密码通过绑定目标 SSH helper 身份的 OpenSSH ASKPASS 提供。
 - 凭据保护：密码不进入命令行参数、环境变量或临时脚本。
 - 连接保护：默认 10 秒连接超时、单次尝试和 SSH keepalive。
 - 终端恢复：SSH 退出后恢复 TTY，并关闭远端程序可能遗留的备用屏、鼠标和括号粘贴模式。
@@ -20,7 +20,7 @@
 
 - macOS 或 Linux。
 - `ssh`，通常由系统自带。
-- `sshpass`：可选；未安装时，密码自动填入需要 OpenSSH 8.4 或更新版本。
+- 密码自动填入需要 OpenSSH 8.4 或更新版本。
 - `ansible`：仅批量执行和 inventory 验证需要。
 - Go 1.27 或更新版本：仅从源码构建需要。
 
@@ -96,14 +96,14 @@ s -e 192.168.1.100 22 MyPassword123
 # 2. 密钥认证（自动识别路径或常见私钥后缀）
 s -e 192.168.1.100 22 ~/.ssh/my_vps.pem
 
-# 3. 省略默认端口 22
+# 3. 省略端口（继承 default.port，未配置时使用 22）
 s -e 192.168.1.100 MyPassword123
 
 # 4. 自定义用户名或别名
 s -e ubuntu@1.2.3.4 22 MyPassword123 "测试机"
 s -e root@1.2.3.4:2222 MyPassword123
 ```
-
+支持裸 IPv6 地址；指定 IPv6 端口时使用 `[2001:db8::1]:2222`。快速添加使用独立锁串行化读改写，支持空列表、流式列表及字段顺序变化，保留 YAML 注释，但可能统一缩进与排版。配置仅支持一个 YAML 文档。
 
 ## 配置
 
@@ -145,7 +145,7 @@ servers:
 | `name` | 显示名称，也是 Ansible 主机别名；建议保持唯一 |
 | `group` | TUI 和 Ansible 分组，默认 `Default` |
 | `host` | SSH 主机名或地址，必填 |
-| `port` | SSH 端口，默认 `22` |
+| `port` | SSH 端口，默认继承 `default.port`，最终回退为 `22` |
 | `user` | SSH 用户，默认继承 `default.user`，最终回退为 `root` |
 | `auth` | `key` 或 `password`；省略时根据是否存在 `password` 推断 |
 | `key` | 私钥路径，支持 `~/`，可继承 `default.key` |
@@ -179,12 +179,9 @@ args: ["-o", "ConnectTimeout=30"]
 
 ## 密码认证
 
-密码认证按以下顺序选择后端：
+密码连接统一通过 ASKPASS：在权限为 `0700` 的临时目录内建立 Unix socket，仅向目标 SSH 直接启动且通过进程身份校验的 helper 提供密码。代理 SSH 的 helper 和无关进程不会获得目标密码；跳板机应单独配置密钥或其他认证方式。
 
-1. 已安装 `sshpass`：通过私有文件描述符传递密码。
-2. 未安装 `sshpass`：通过权限为 `0700` 的临时目录和本地 Unix socket 提供 ASKPASS。
-
-ASKPASS 只回答 SSH 的密码提示，不回答主机确认或私钥 passphrase，也不会在登录后的远端程序再次显示 `password:` 时自动输入。
+ASKPASS 只回答 SSH 的密码提示，不回答主机确认或私钥 passphrase，也不会在登录后的远端程序再次显示 `password:` 时自动输入。不再使用无法区分目标和跳板机提示的 `sshpass`。
 
 配置文件和导出的 inventory 可能包含明文密码。不要提交 `servers.yaml`，导出 INI 时应限制权限：
 
@@ -231,7 +228,7 @@ go vet ./...
 git diff --check
 ```
 
-测试使用本地替身，不连接真实远端主机。安装 `expect`、`sshpass` 和 `ansible-inventory` 后，会覆盖伪终端交互、两种密码后端、Ghostty 标题以及 inventory 往返。
+测试使用本地替身，不连接真实远端主机。安装 `expect` 和 `ansible-inventory` 后，会覆盖伪终端交互、ASKPASS 认证隔离、Ghostty 标题以及 inventory 往返。
 
 面向用户的行为变更必须同步更新 `VERSION` 和 `CHANGELOG.md`。维护者发布版本时，在提交后执行：
 
@@ -239,7 +236,9 @@ git diff --check
 make release
 ```
 
-该目标会重新运行测试与静态检查，要求工作区干净，创建对应的 `vX.Y.Z` 标签，并原子推送提交和标签。推送失败时只删除本次尚未发布的本地标签，便于安全重试。
+该目标会重新运行测试与静态检查，要求工作区干净、当前分支为 `origin` 的默认分支，并校验 `VERSION` 为无前导零的三段数字 `X.Y.Z`（不支持预发布或构建后缀）。随后创建对应的 `vX.Y.Z` 标签，原子推送明确的分支引用和标签。推送失败时先核实远端：仅清理本次创建且确认未发布的本地标签；远端已有标签或状态无法确认时保留本地标签，需人工核查后重试。禁止覆盖已发布标签。
+
+GitHub 发布工作流校验标签与 `VERSION` 一致，并要求 `CHANGELOG.md` 有对应的非空版本说明；同标签发布串行执行，任务超时为 20 分钟，Action 固定完整提交 SHA。
 
 ## 贡献
 

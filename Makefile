@@ -2,22 +2,25 @@
 
 BINARY_NAME=sshtui
 INSTALL_DIR=$(HOME)/.local/bin
-VERSION=$(shell cat VERSION)
 
 all: build
 
 build:
-	go build -ldflags="-s -w" -o $(BINARY_NAME) main.go
+	go build -ldflags="-s -w" -o "$(BINARY_NAME)" .
 
 install: build
-	mkdir -p $(INSTALL_DIR)
-	cp $(BINARY_NAME) $(INSTALL_DIR)/.$(BINARY_NAME).new
-	mv -f $(INSTALL_DIR)/.$(BINARY_NAME).new $(INSTALL_DIR)/$(BINARY_NAME)
-	ln -sf $(INSTALL_DIR)/$(BINARY_NAME) $(INSTALL_DIR)/s
+	@mkdir -p "$(INSTALL_DIR)"
+	@set -eu; tmp_file="$$(mktemp "$(INSTALL_DIR)/.$(BINARY_NAME).XXXXXX")"; \
+	trap 'rm -f "$$tmp_file"' EXIT; \
+	cp "$(BINARY_NAME)" "$$tmp_file" && \
+	chmod 755 "$$tmp_file" && \
+	mv -f "$$tmp_file" "$(INSTALL_DIR)/$(BINARY_NAME)" && \
+	ln -sf "$(INSTALL_DIR)/$(BINARY_NAME)" "$(INSTALL_DIR)/s" && \
+	trap - EXIT
 	@echo "✓ 安装成功！已写入 $(INSTALL_DIR)/$(BINARY_NAME) 并软链接为 $(INSTALL_DIR)/s"
 
 clean:
-	rm -f $(BINARY_NAME)
+	rm -f "$(BINARY_NAME)"
 	rm -rf dist
 
 check:
@@ -28,9 +31,8 @@ check:
 # Commit VERSION and CHANGELOG.md before publishing an immutable version tag.
 release: check
 	@test -z "$$(git status --porcelain)" || (echo "请先提交所有改动，再发布版本"; exit 1)
-	@tag=v$(VERSION); \
-	git tag -a "$$tag" -m "sshtui $(VERSION)" || exit; \
-	if ! git push --atomic origin HEAD "refs/tags/$$tag"; then \
-		git tag -d "$$tag" >/dev/null; \
-		exit 1; \
-	fi
+	@./scripts/release-check.sh
+	@set -eu; branch="$$(git symbolic-ref --short HEAD)"; \
+	version="$$(./scripts/read-version.sh VERSION)"; \
+	tag="v$$version"; \
+	./scripts/push-release.sh "$$tag" "$$branch"

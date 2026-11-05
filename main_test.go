@@ -17,7 +17,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -43,19 +42,6 @@ func TestMain(m *testing.M) {
 				writeTestRecord(".title-reset", os.Args[4:])
 			}
 			os.Exit(0)
-		case "sshpass":
-			fd, _ := strconv.Atoi(os.Args[2])
-			f := os.NewFile(uintptr(fd), "password")
-			data, err := io.ReadAll(f)
-			if err != nil {
-				panic(err)
-			}
-			f.Close()
-			writeTestRecord(".password", string(data))
-			writeTestRecord(".helper", os.Args)
-			if err := syscall.Exec(os.Args[3], append([]string{"ssh"}, os.Args[4:]...), os.Environ()); err != nil {
-				panic(err)
-			}
 		case "ansible":
 			writeTestRecord(".ansible", os.Args[1:])
 			os.Exit(7)
@@ -580,7 +566,7 @@ func TestViewFitsWindowAndKeepsSelectionVisible(t *testing.T) {
 }
 
 func TestSSHInvocation(t *testing.T) {
-	for _, backend := range []string{"key", "sshpass", "askpass"} {
+	for _, backend := range []string{"key", "askpass"} {
 		t.Run(backend, func(t *testing.T) {
 			auth := "password"
 			if backend == "key" {
@@ -590,9 +576,6 @@ func TestSSHInvocation(t *testing.T) {
 			bin := t.TempDir()
 			binary, _ := os.Executable()
 			linkHelper(t, bin, "ssh", binary)
-			if backend == "sshpass" {
-				linkHelper(t, bin, "sshpass", binary)
-			}
 			log := filepath.Join(t.TempDir(), "log")
 			out, err := cliCommand(t, map[string]string{"HOME": home, "PATH": bin, "SSHTUI_TEST_LOG": log}, "node").CombinedOutput()
 			if err == nil || err.(*exec.ExitError).ExitCode() != 17 {
@@ -608,12 +591,6 @@ func TestSSHInvocation(t *testing.T) {
 			for _, option := range []string{"ConnectTimeout=10", "ConnectionAttempts=1"} {
 				if !slices.Contains(args, option) {
 					t.Errorf("SSH invocation missing %s: %q", option, args)
-				}
-			}
-			if backend == "sshpass" {
-				helper := readRecord[[]string](t, log+".helper")
-				if readRecord[string](t, log+".password") != "dummy-secret\n" || helper[1] != "-d" || strings.Contains(strings.Join(helper, " "), "dummy-secret") {
-					t.Fatal("password must use a descriptor, not argv")
 				}
 			}
 		})
@@ -759,10 +736,8 @@ func TestPasswordHelperInteractiveSession(t *testing.T) {
 	}{
 		{"askpass", "password", false, false},
 		{"askpass", "agent", false, false},
-		{"sshpass", "password", false, false},
 		{"key", "agent", true, false},
 		{"askpass", "password", true, false},
-		{"sshpass", "password", true, false},
 		{"key", "agent", true, true},
 	} {
 		t.Run(fmt.Sprintf("%s/%s/ghostty=%t/failure=%t", tc.backend, tc.mode, tc.ghostty, tc.titleFailure), func(t *testing.T) {
@@ -787,20 +762,13 @@ func TestPasswordHelperInteractiveSession(t *testing.T) {
 			if tc.ghostty {
 				linkHelper(t, bin, "osascript", binary)
 			}
-			if tc.backend == "sshpass" {
-				sshpass, err := exec.LookPath("sshpass")
-				if err != nil {
-					t.Skip("sshpass is not installed")
-				}
-				linkHelper(t, bin, "sshpass", sshpass)
-			}
 			stty, err := exec.LookPath("stty")
 			if err != nil {
 				t.Fatal(err)
 			}
 			linkHelper(t, bin, "stty", stty)
 			log := filepath.Join(t.TempDir(), "log")
-			// Expect drives the terminal; the app uses real sshpass or ASKPASS.
+			// Expect drives the terminal and ASKPASS authentication.
 			driver := `
 set timeout 4
 spawn -noecho $env(SSHTUI_TEST_BINARY) node
@@ -919,24 +887,14 @@ func TestAskpassRejectsNonPasswordPrompts(t *testing.T) {
 	}
 }
 
-func TestPasswordPipe(t *testing.T) {
-	password := strings.Repeat("p", 1023)
-	f, err := passwordPipe(password)
-	if err != nil {
+func TestPasswordBoundaries(t *testing.T) {
+	if err := validatePassword(strings.Repeat("p", 1023)); err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
-	data, err := io.ReadAll(f)
-	if err != nil || string(data) != password+"\n" {
-		t.Fatal("password pipe lost bytes or did not reach EOF")
-	}
-	flags, err := unix.FcntlInt(f.Fd(), unix.F_GETFD, 0)
-	if err != nil || flags&unix.FD_CLOEXEC != 0 {
-		t.Fatal("password descriptor would not survive Exec")
-	}
-	if f, err := passwordPipe(password + "p"); err == nil {
-		f.Close()
-		t.Fatal("overlong password must be rejected rather than truncated")
+	for _, password := range []string{strings.Repeat("p", 1024), "nul\x00byte", "line\nfeed", "carriage\rreturn"} {
+		if err := validatePassword(password); err == nil {
+			t.Fatal("invalid password accepted")
+		}
 	}
 }
 
@@ -1008,7 +966,7 @@ func TestParseServerArgs(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		s, err := parseServerArgs(tc.args, "root")
+		s, err := parseServerArgs(tc.args, "root", 22)
 		if err != nil {
 			t.Fatalf("parseServerArgs(%v) failed: %v", tc.args, err)
 		}

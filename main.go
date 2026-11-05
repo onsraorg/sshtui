@@ -6,7 +6,6 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -200,6 +199,9 @@ func loadConfig() (*Config, string, error) {
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&cfg); err != nil {
 		return nil, "", fmt.Errorf("解析 YAML 配置文件失败: %w", err)
+	}
+	if err := decoder.Decode(new(yaml.Node)); err != io.EOF {
+		return nil, "", fmt.Errorf("配置只允许一个 YAML 文档")
 	}
 
 	if cfg.Default.ServerAliveInterval <= 0 {
@@ -531,36 +533,18 @@ func validatePassword(password string) error {
 	return nil
 }
 
-func passwordPipe(password string) (*os.File, error) {
-	if err := validatePassword(password); err != nil {
-		return nil, err
-	}
-	r, w, err := os.Pipe()
-	if err != nil {
-		return nil, err
-	}
-	// At most 1024 bytes fit in a macOS/Linux pipe before Exec starts the reader.
-	_, err = io.WriteString(w, password+"\n")
-	err = errors.Join(err, w.Close())
-	if err == nil {
-		_, err = unix.FcntlInt(r.Fd(), unix.F_SETFD, 0)
-	}
-	if err != nil {
-		r.Close()
-		return nil, err
-	}
-	return r, nil
-}
-
 // Only local SSH authentication can request the password through ASKPASS.
 // Keep the socket private and secrets out of argv, environment variables and scripts.
 func runWithAskpass(sshPath string, args []string, password string, env []string) error {
+	if err := validatePassword(password); err != nil {
+		return err
+	}
 	self, err := os.Executable()
 	if err != nil {
 		return err
 	}
 	// Keep Unix socket paths below the platform's roughly 104-byte limit.
-	dir, err := os.MkdirTemp("/tmp", "sshtui-askpass-")
+	dir, err := os.MkdirTemp(os.TempDir(), "sshtui-askpass-")
 	if err != nil {
 		return err
 	}
@@ -571,13 +555,23 @@ func runWithAskpass(sshPath string, args []string, password string, env []string
 		return err
 	}
 	defer listener.Close()
+
+	pidChan := make(chan int, 1)
+	defer close(pidChan)
+
 	go func() {
+		expectedPID, ok := <-pidChan
+		if !ok || expectedPID <= 0 {
+			return
+		}
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
 				return
 			}
-			_, _ = io.WriteString(conn, password+"\n")
+			if isAuthorizedPeer(conn, expectedPID, self) {
+				_, _ = io.WriteString(conn, password+"\n")
+			}
 			conn.Close()
 		}
 	}()
@@ -589,10 +583,44 @@ func runWithAskpass(sshPath string, args []string, password string, env []string
 		}
 	}
 	cmd.Env = append(cmd.Env, "SSH_ASKPASS="+self, "SSH_ASKPASS_REQUIRE=force", "SSHTUI_ASKPASS_SOCKET="+path, "SSHTUI_ASKPASS_HELPER=1")
-	return runSSH(cmd)
+	return runSSH(cmd, func(pid int) {
+		pidChan <- pid
+	})
 }
 
-func runSSH(cmd *exec.Cmd) error {
+func isAuthorizedPeer(conn net.Conn, expectedPID int, expectedExe string) bool {
+	if expectedPID <= 0 {
+		return false
+	}
+	peerPID, err := getPeerPID(conn)
+	if err != nil || peerPID <= 0 {
+		return false
+	}
+	ppid, err := getProcessPPID(peerPID)
+	if err != nil || ppid != expectedPID {
+		return false
+	}
+	exePath, err := getProcessPath(peerPID)
+	if err != nil {
+		return false
+	}
+	if infoPeer, err1 := os.Stat(exePath); err1 == nil {
+		if infoExp, err2 := os.Stat(expectedExe); err2 == nil && os.SameFile(infoPeer, infoExp) {
+			return true
+		}
+	}
+	realExpected, err := filepath.EvalSymlinks(expectedExe)
+	if err != nil {
+		realExpected = expectedExe
+	}
+	realPeer, err := filepath.EvalSymlinks(exePath)
+	if err != nil {
+		realPeer = exePath
+	}
+	return realPeer == realExpected
+}
+
+func runSSH(cmd *exec.Cmd, onStart ...func(pid int)) error {
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	var terminalState *term.State
 	if term.IsTerminal(int(os.Stdin.Fd())) {
@@ -609,6 +637,9 @@ func runSSH(cmd *exec.Cmd) error {
 	defer signal.Stop(signals)
 	if err := cmd.Start(); err != nil {
 		return err
+	}
+	if len(onStart) > 0 && onStart[0] != nil && cmd.Process != nil {
+		onStart[0](cmd.Process.Pid)
 	}
 	done := make(chan struct{})
 	defer close(done)
@@ -791,8 +822,14 @@ func answerAskpass() error {
 		return err
 	}
 	defer conn.Close()
-	_, err = io.Copy(os.Stdout, conn)
-	return err
+	n, err := io.Copy(os.Stdout, conn)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("此 SSH 提示不能使用服务器密码自动回答")
+	}
+	return nil
 }
 
 func connectToServer(s *ServerConfig, cfg *Config) error {
@@ -833,22 +870,7 @@ func connectToServer(s *ServerConfig, cfg *Config) error {
 		return syscall.Exec(sshPath, append([]string{"ssh"}, args...), env)
 	}
 
-	helper, err := exec.LookPath("sshpass")
-	if err != nil {
-		return runWithAskpass(sshPath, args, s.Password, env)
-	}
-	input, err := passwordPipe(s.Password)
-	if err != nil {
-		return fmt.Errorf("准备密码描述符失败: %w", err)
-	}
-	defer input.Close()
-	if restoreTitle != nil || term.IsTerminal(int(os.Stdin.Fd())) {
-		cmd := exec.Command(helper, append([]string{"-d", "3", sshPath}, args...)...)
-		cmd.Env, cmd.ExtraFiles = env, []*os.File{input}
-		return runSSH(cmd)
-	}
-	fd := strconv.FormatUint(uint64(input.Fd()), 10)
-	return syscall.Exec(helper, append([]string{"sshpass", "-d", fd, sshPath}, args...), env)
+	return runWithAskpass(sshPath, args, s.Password, env)
 }
 
 func shellQuote(s string) string {
@@ -1084,7 +1106,7 @@ func isKeyPath(s string) bool {
 	return false
 }
 
-func parseServerArgs(args []string, defaultUser string) (*ServerConfig, error) {
+func parseServerArgs(args []string, defaultUser string, defaultPort int) (*ServerConfig, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("缺少服务器参数。用法: s -e [user@]host [port] [password|key] [name] [group]")
 	}
@@ -1106,20 +1128,21 @@ func parseServerArgs(args []string, defaultUser string) (*ServerConfig, error) {
 		target = rem
 	}
 
-	if h, p, err := net.SplitHostPort(target); err == nil {
+	if ip := net.ParseIP(target); ip != nil {
+		s.Host = target
+	} else if h, p, err := net.SplitHostPort(target); err == nil {
 		s.Host = h
-		if port, err := strconv.Atoi(p); err == nil && port > 0 && port <= 65535 {
-			s.Port = port
+		port, err := strconv.Atoi(p)
+		if err != nil || port < 1 || port > 65535 {
+			return nil, fmt.Errorf("端口必须在 1–65535 之间")
 		}
-	} else if idx := strings.LastIndex(target, ":"); idx != -1 && !strings.Contains(target, "]") {
-		if port, err := strconv.Atoi(target[idx+1:]); err == nil && port > 0 && port <= 65535 {
-			s.Port = port
-			s.Host = target[:idx]
-		} else {
-			s.Host = target
-		}
+		s.Port = port
+	} else if strings.HasPrefix(target, "[") && strings.HasSuffix(target, "]") && net.ParseIP(target[1:len(target)-1]) != nil {
+		s.Host = target[1 : len(target)-1]
+	} else if strings.ContainsAny(target, ":[]") {
+		return nil, fmt.Errorf("无效的主机或端口: %s", target)
 	} else {
-		s.Host = strings.Trim(target, "[]")
+		s.Host = target
 	}
 
 	if s.Host == "" {
@@ -1160,7 +1183,15 @@ func parseServerArgs(args []string, defaultUser string) (*ServerConfig, error) {
 	}
 
 	if s.Port <= 0 {
-		s.Port = 22
+		s.Port = cmp.Or(defaultPort, 22)
+	}
+	if s.Port < 1 || s.Port > 65535 {
+		return nil, fmt.Errorf("端口必须在 1–65535 之间")
+	}
+	for _, field := range []string{s.Host, s.User, s.Name, s.Group} {
+		if strings.IndexFunc(field, unicode.IsControl) >= 0 {
+			return nil, fmt.Errorf("服务器字段不能包含控制字符")
+		}
 	}
 	if s.Auth == "" {
 		s.Auth = "key"
@@ -1180,11 +1211,27 @@ func quickAddServer(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("缺少服务器参数。用法: s -e [user@]host [port] [password|key] [name] [group]")
 	}
+	cfgPath, err := getConfigPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0700); err != nil {
+		return err
+	}
+	lock, err := os.OpenFile(cfgPath+".lock", os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW, 0600)
+	if err != nil {
+		return fmt.Errorf("打开配置锁失败: %w", err)
+	}
+	defer lock.Close()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		return fmt.Errorf("锁定配置失败: %w", err)
+	}
+	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
 	cfg, cfgPath, err := loadConfig()
 	if err != nil {
 		return err
 	}
-	server, err := parseServerArgs(args, cfg.Default.User)
+	server, err := parseServerArgs(args, cfg.Default.User, cfg.Default.Port)
 	if err != nil {
 		return err
 	}
@@ -1199,28 +1246,49 @@ func quickAddServer(args []string) error {
 		return fmt.Errorf("读取配置文件失败: %w", err)
 	}
 
-	var entry strings.Builder
-	if !bytes.Contains(raw, []byte("servers:")) {
-		entry.WriteString("\nservers:\n")
+	var document yaml.Node
+	if err := yaml.Unmarshal(raw, &document); err != nil {
+		return fmt.Errorf("解析 YAML 配置失败: %w", err)
 	}
-	entry.WriteString(fmt.Sprintf("\n  - name: %q\n    group: %q\n    host: %q\n    port: %d\n    user: %q\n    auth: %q\n",
-		server.Name, server.Group, server.Host, server.Port, server.User, server.Auth))
-	if server.Auth == "key" {
-		entry.WriteString(fmt.Sprintf("    key: %q\n", server.Key))
-	} else {
-		entry.WriteString(fmt.Sprintf("    password: %q\n", server.Password))
+	root := document.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return fmt.Errorf("配置必须为 YAML 映射")
 	}
-
-	updated := bytes.TrimRight(raw, " \t\r\n")
-	updated = append(updated, []byte(entry.String())...)
-	updated = append(updated, '\n')
-
-	var testCfg Config
-	decoder := yaml.NewDecoder(bytes.NewReader(updated))
-	decoder.KnownFields(true)
-	if err := decoder.Decode(&testCfg); err != nil {
-		return fmt.Errorf("追加后配置校验失败: %w", err)
+	var servers *yaml.Node
+	for i := 0; i < len(root.Content); i += 2 {
+		if root.Content[i].Value == "servers" {
+			servers = root.Content[i+1]
+			break
+		}
 	}
+	if servers == nil {
+		servers = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+		root.Content = append(root.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: "servers"}, servers)
+	}
+	if servers.Kind == yaml.AliasNode {
+		servers = servers.Alias
+	}
+	if servers.Tag == "!!null" {
+		servers.Kind, servers.Tag, servers.Value = yaml.SequenceNode, "!!seq", ""
+	}
+	if servers.Kind != yaml.SequenceNode {
+		return fmt.Errorf("servers 必须为 YAML 序列")
+	}
+	var entry yaml.Node
+	if err := entry.Encode(server); err != nil {
+		return err
+	}
+	servers.Content = append(servers.Content, &entry)
+	var buffer bytes.Buffer
+	encoder := yaml.NewEncoder(&buffer)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(&document); err != nil {
+		return fmt.Errorf("编码 YAML 配置失败: %w", err)
+	}
+	if err := encoder.Close(); err != nil {
+		return err
+	}
+	updated := buffer.Bytes()
 
 	dir := filepath.Dir(cfgPath)
 	temp, err := os.CreateTemp(dir, "sshtui-servers-*.yaml")
@@ -1255,7 +1323,6 @@ func quickAddServer(args []string) error {
 	fmt.Printf("  • 认证: %s\n", authDesc)
 	return nil
 }
-
 
 func directMatch(servers []ServerConfig, term string) *ServerConfig {
 	var exact, partial *ServerConfig
