@@ -37,15 +37,17 @@ var version string
 
 // ServerConfig describes one SSH target.
 type ServerConfig struct {
-	Name     string   `yaml:"name"`
-	Group    string   `yaml:"group"`
-	Host     string   `yaml:"host"`
-	Port     int      `yaml:"port"`
-	User     string   `yaml:"user"`
-	Auth     string   `yaml:"auth"` // "key" or "password"
-	Key      string   `yaml:"key"`
-	Password string   `yaml:"password"`
-	Args     []string `yaml:"args"` // Additional SSH arguments.
+	Name        string   `yaml:"name"`
+	Group       string   `yaml:"group"`
+	Host        string   `yaml:"host"`
+	Port        int      `yaml:"port"`
+	User        string   `yaml:"user"`
+	Auth        string   `yaml:"auth"` // "key" or "password"
+	Key         string   `yaml:"key"`
+	Password    string   `yaml:"password"`
+	Args        []string `yaml:"args"` // Additional SSH arguments.
+	Archived    bool     `yaml:"archived,omitempty"`
+	sourceIndex int
 }
 
 // Config holds defaults and SSH targets.
@@ -213,6 +215,7 @@ func loadConfig() (*Config, string, error) {
 
 	for i := range cfg.Servers {
 		s := &cfg.Servers[i]
+		s.sourceIndex = i
 		s.User = cmp.Or(s.User, cfg.Default.User, "root")
 		s.Port = cmp.Or(s.Port, cfg.Default.Port, 22)
 		s.Group = cmp.Or(s.Group, "Default")
@@ -256,15 +259,17 @@ func loadConfig() (*Config, string, error) {
 }
 
 type model struct {
-	config      *Config
-	filter      string
-	filtered    []ServerConfig
-	cursor      int
-	viewportTop int
-	selected    *ServerConfig
-	width       int
-	height      int
-	quitting    bool
+	config       *Config
+	filter       string
+	filtered     []ServerConfig
+	cursor       int
+	viewportTop  int
+	selected     *ServerConfig
+	width        int
+	height       int
+	quitting     bool
+	showArchived bool
+	status       string
 }
 
 func initialModel(cfg *Config, initialFilter string) model {
@@ -280,18 +285,16 @@ func initialModel(cfg *Config, initialFilter string) model {
 }
 
 func (m *model) applyFilter() {
-	if m.filter == "" {
-		m.filtered = m.config.Servers
-	} else {
-		lowerFilter := strings.ToLower(m.filter)
-		var res []ServerConfig
-		for _, s := range m.config.Servers {
-			target := strings.ToLower(fmt.Sprintf("%s %s %s %s", s.Name, s.Group, s.Host, s.User))
-			if strings.Contains(target, lowerFilter) {
-				res = append(res, s)
-			}
+	lowerFilter := strings.ToLower(m.filter)
+	m.filtered = nil
+	for _, s := range m.config.Servers {
+		if s.Archived && !m.showArchived {
+			continue
 		}
-		m.filtered = res
+		target := strings.ToLower(fmt.Sprintf("%s %s %s %s", s.Name, s.Group, s.Host, s.User))
+		if strings.Contains(target, lowerFilter) {
+			m.filtered = append(m.filtered, s)
+		}
 	}
 
 	m.cursor = max(0, min(m.cursor, len(m.filtered)-1))
@@ -341,7 +344,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		m.status = ""
 		switch msg.Type {
+		case tea.KeyF2:
+			if len(m.filtered) == 0 {
+				return m, nil
+			}
+			target := m.filtered[m.cursor]
+			cfg, err := setServerArchived(target, !target.Archived)
+			if err != nil {
+				m.status = "保存失败: " + err.Error()
+				return m, nil
+			}
+			m.config = cfg
+			m.status = "已归档；F3 查看并恢复"
+			if target.Archived {
+				m.status = "已恢复"
+			}
+			m.applyFilter()
+			return m, nil
+
+		case tea.KeyF3:
+			m.showArchived = !m.showArchived
+			m.status = ""
+			m.applyFilter()
+			return m, nil
+
 		case tea.KeyCtrlC:
 			m.quitting = true
 			return m, tea.Quit
@@ -386,6 +414,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyEnter:
 			if m.width >= 16 && m.height >= 4 && len(m.filtered) > 0 && m.cursor < len(m.filtered) {
 				chosen := m.filtered[m.cursor]
+				if chosen.Archived {
+					m.status = "已归档，请先按 F2 恢复"
+					return m, nil
+				}
 				m.selected = &chosen
 				return m, tea.Quit
 			}
@@ -439,7 +471,7 @@ func (m model) View() string {
 	searchBar := headerBox.Render(searchPrompt + searchText + cursorBlock)
 
 	title := lipgloss.NewStyle().Bold(true).Foreground(primaryColor).Render("⚡ GHOSTTY SSH PICKER")
-	subTitle := lipgloss.NewStyle().Foreground(dimColor).Render("  上下移动选择，回车直接连接")
+	subTitle := lipgloss.NewStyle().Foreground(dimColor).Render("  F2 归档/恢复 · F3 显示/隐藏归档")
 	head := title + subTitle
 
 	var b strings.Builder
@@ -472,6 +504,10 @@ func (m model) View() string {
 			if s.Auth == "password" {
 				authBadge = lipgloss.NewStyle().Foreground(passBadgeColor).Render("🔒 密码")
 			}
+			if s.Archived {
+				nameColor, connColor = dimColor, dimColor
+				authBadge = lipgloss.NewStyle().Foreground(dimColor).Render("[已归档]")
+			}
 			content := fmt.Sprintf("%s %s %s %s",
 				lipgloss.NewStyle().Foreground(accentColor).Bold(isSelected).Render(fitColumn("["+s.Group+"]", 9)),
 				lipgloss.NewStyle().Foreground(nameColor).Bold(isSelected).Render(fitColumn(s.Name, 20)),
@@ -483,18 +519,7 @@ func (m model) View() string {
 	}
 
 	b.WriteString("\n")
-	helpKey := lipgloss.NewStyle().Foreground(primaryColor).Bold(true)
-	helpDesc := lipgloss.NewStyle().Foreground(dimColor)
-	countInfo := lipgloss.NewStyle().Foreground(dimColor).Render(fmt.Sprintf("(%d/%d)", len(m.filtered), len(m.config.Servers)))
-
-	footer := fmt.Sprintf("  %s %s  %s %s  %s %s  %s %s  %s",
-		helpKey.Render("↑/↓"), helpDesc.Render("选择"),
-		helpKey.Render("Enter"), helpDesc.Render("连接"),
-		helpKey.Render("输入"), helpDesc.Render("过滤"),
-		helpKey.Render("Esc"), helpDesc.Render("清除/退出"),
-		countInfo,
-	)
-	b.WriteString(footer + "\n")
+	b.WriteString("  " + runewidth.Truncate(m.footer(), m.width-2, "…") + "\n")
 
 	return b.String()
 }
@@ -506,7 +531,11 @@ func fitColumn(s string, width int) string {
 // Use compact columns when the detailed list would hide servers.
 func (m model) compactView() string {
 	fit := func(s string) string { return runewidth.Truncate(s, m.width, "…") }
-	lines := []string{fit("⚡ SSH PICKER"), fit("❯ " + runewidth.TruncateLeft(m.filter, m.width-2, "…"))}
+	title := "SSH · F2 归档/恢复 F3 显示归档"
+	if m.showArchived {
+		title = "SSH · F2 归档/恢复 F3 隐藏归档"
+	}
+	lines := []string{fit(title), fit("❯ " + runewidth.TruncateLeft(m.filter, m.width-2, "…"))}
 	rows, columns := m.listLayout()
 	columnWidth := (m.width - 2*(columns-1)) / columns
 	end := min(len(m.filtered), m.viewportTop+rows*columns)
@@ -522,12 +551,21 @@ func (m model) compactView() string {
 			}
 			s := m.filtered[i]
 			address := fmt.Sprintf("%s@%s:%d", s.User, s.Host, s.Port)
+			if s.Archived {
+				address = "[已归档]"
+			}
 			addressWidth := min(runewidth.StringWidth(address), (columnWidth-3)*2/3)
 			nameWidth := columnWidth - addressWidth - 3
 			cell := "  " + fitColumn(s.Name, nameWidth) + " " + fitColumn(address, addressWidth)
+			color := lipgloss.Color("#38bdf8")
+			if s.Archived {
+				color = lipgloss.Color("#64748b")
+			}
 			if i == m.cursor {
 				cell = "❯ " + strings.TrimPrefix(cell, "  ")
-				cell = lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Bold(true).Render(cell)
+			}
+			if s.Archived || i == m.cursor {
+				cell = lipgloss.NewStyle().Foreground(color).Bold(i == m.cursor).Render(cell)
 			}
 			line.WriteString(cell)
 		}
@@ -536,8 +574,15 @@ func (m model) compactView() string {
 	if len(m.filtered) == 0 {
 		lines = append(lines, fit("未找到服务器，Esc 清空"))
 	}
-	lines = append(lines, fit(fmt.Sprintf("↑↓←→ 选择 Enter 连接 Esc 返回 (%d/%d)", len(m.filtered), len(m.config.Servers))))
+	lines = append(lines, fit(m.footer()))
 	return strings.Join(lines, "\n")
+}
+
+func (m model) footer() string {
+	if m.status != "" {
+		return m.status
+	}
+	return fmt.Sprintf("↑↓←→ 选择 Enter 连接 Esc 返回 (%d/%d)", len(m.filtered), len(m.config.Servers))
 }
 
 // OpenSSH uses the first value, so explicit options must precede defaults.
@@ -925,6 +970,9 @@ func inventoryGroup(s ServerConfig) string {
 func validateInventory(cfg *Config) error {
 	seen := make(map[string]bool)
 	for _, s := range cfg.Servers {
+		if s.Archived {
+			continue
+		}
 		name := inventoryName(s)
 		if seen[name] {
 			return fmt.Errorf("Ansible 主机名称重复: %q，请为服务器设置不同的 name", name)
@@ -966,6 +1014,9 @@ func generateAnsibleJSON(cfg *Config) ([]byte, error) {
 	hostvars := make(map[string]interface{})
 	groups := make(map[string][]string)
 	for _, s := range cfg.Servers {
+		if s.Archived {
+			continue
+		}
 		name, group := inventoryName(s), inventoryGroup(s)
 		groups[group] = append(groups[group], name)
 		hostvars[name] = inventoryVars(s, cfg)
@@ -988,6 +1039,9 @@ func generateAnsibleINI(cfg *Config) (string, error) {
 	var b strings.Builder
 	groups := make(map[string][]ServerConfig)
 	for _, s := range cfg.Servers {
+		if s.Archived {
+			continue
+		}
 		groups[inventoryGroup(s)] = append(groups[inventoryGroup(s)], s)
 	}
 	for _, g := range slices.Sorted(maps.Keys(groups)) {
@@ -1242,6 +1296,39 @@ func quickAddServer(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("缺少服务器参数。用法: s -e [user@]host [port] [password|key] [name] [group]")
 	}
+	var server *ServerConfig
+	err := editServersConfig(func(cfg *Config, servers *yaml.Node) error {
+		var err error
+		server, err = parseServerArgs(args, cfg.Default.User, cfg.Default.Port)
+		if err != nil {
+			return err
+		}
+		if err := validatePassword(server.Password); err != nil {
+			return err
+		}
+		var entry yaml.Node
+		if err := entry.Encode(server); err != nil {
+			return err
+		}
+		servers.Content = append(servers.Content, &entry)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	authDesc := "密码认证"
+	if server.Auth == "key" {
+		authDesc = "密钥认证: " + server.Key
+	}
+	fmt.Println("✓ 已成功将服务器添加到配置文件")
+	fmt.Printf("  • 名称: %s\n", server.Name)
+	fmt.Printf("  • 分组: %s\n", server.Group)
+	fmt.Printf("  • 目标: %s@%s\n", server.User, net.JoinHostPort(server.Host, strconv.Itoa(server.Port)))
+	fmt.Printf("  • 认证: %s\n", authDesc)
+	return nil
+}
+
+func editServersConfig(edit func(*Config, *yaml.Node) error) error {
 	cfgPath, err := getConfigPath()
 	if err != nil {
 		return err
@@ -1261,15 +1348,6 @@ func quickAddServer(args []string) error {
 	cfg, cfgPath, err := loadConfig()
 	if err != nil {
 		return err
-	}
-	server, err := parseServerArgs(args, cfg.Default.User, cfg.Default.Port)
-	if err != nil {
-		return err
-	}
-	if server.Auth == "password" {
-		if err := validatePassword(server.Password); err != nil {
-			return err
-		}
 	}
 
 	raw, err := os.ReadFile(cfgPath)
@@ -1305,11 +1383,9 @@ func quickAddServer(args []string) error {
 	if servers.Kind != yaml.SequenceNode {
 		return fmt.Errorf("servers 必须为 YAML 序列")
 	}
-	var entry yaml.Node
-	if err := entry.Encode(server); err != nil {
+	if err := edit(cfg, servers); err != nil {
 		return err
 	}
-	servers.Content = append(servers.Content, &entry)
 	var buffer bytes.Buffer
 	encoder := yaml.NewEncoder(&buffer)
 	encoder.SetIndent(2)
@@ -1343,15 +1419,6 @@ func quickAddServer(args []string) error {
 		return fmt.Errorf("保存配置文件失败: %w", err)
 	}
 
-	authDesc := "密码认证"
-	if server.Auth == "key" {
-		authDesc = "密钥认证: " + server.Key
-	}
-	fmt.Printf("✓ 已成功将服务器添加到配置文件 (%s)\n", cfgPath)
-	fmt.Printf("  • 名称: %s\n", server.Name)
-	fmt.Printf("  • 分组: %s\n", server.Group)
-	fmt.Printf("  • 目标: %s@%s\n", server.User, net.JoinHostPort(server.Host, strconv.Itoa(server.Port)))
-	fmt.Printf("  • 认证: %s\n", authDesc)
 	return nil
 }
 
@@ -1360,6 +1427,9 @@ func directMatch(servers []ServerConfig, term string) *ServerConfig {
 	exactCount, partialCount := 0, 0
 	lower := strings.ToLower(term)
 	for i := range servers {
+		if servers[i].Archived {
+			continue
+		}
 		if strings.EqualFold(servers[i].Name, term) {
 			exact, exactCount = &servers[i], exactCount+1
 		}
@@ -1455,13 +1525,24 @@ func run() error {
 		}
 		return err
 	case *list:
-		fmt.Printf("配置文件: %s (共 %d 台)\n\n", cfgPath, len(cfg.Servers))
-		for i, s := range cfg.Servers {
+		count := 0
+		for _, s := range cfg.Servers {
+			if !s.Archived {
+				count++
+			}
+		}
+		fmt.Printf("配置文件: %s (共 %d 台)\n\n", cfgPath, count)
+		i := 0
+		for _, s := range cfg.Servers {
+			if s.Archived {
+				continue
+			}
 			auth := "🔑 密钥"
 			if s.Auth == "password" {
 				auth = "🔒 密码"
 			}
 			fmt.Printf("%2d. [%s] %-20s %s@%s:%d (%s)\n", i+1, s.Group, s.Name, s.User, s.Host, s.Port, auth)
+			i++
 		}
 		return nil
 	}
