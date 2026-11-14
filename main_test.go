@@ -565,6 +565,80 @@ func TestViewFitsWindowAndKeepsSelectionVisible(t *testing.T) {
 	}
 }
 
+func TestPickerShowsAllServersWhenTheyFit(t *testing.T) {
+	for _, tc := range []struct {
+		count, width, height int
+	}{
+		{24, 80, 24},
+		{30, 80, 24},
+		{42, 80, 24},
+		{50, 120, 24},
+		{30, 80, 45},
+		{30, 40, 40},
+	} {
+		t.Run(fmt.Sprintf("%d_servers_%dx%d", tc.count, tc.width, tc.height), func(t *testing.T) {
+			cfg := &Config{}
+			for i := range tc.count {
+				cfg.Servers = append(cfg.Servers, ServerConfig{Name: fmt.Sprintf("node-%02d", i), Host: "192.0.2.1", User: "root", Port: 22})
+			}
+			next, _ := initialModel(cfg, "").Update(tea.WindowSizeMsg{Width: tc.width, Height: tc.height})
+			m := next.(model)
+			for range tc.count + 1 {
+				view := m.View()
+				if lipgloss.Width(view) > tc.width || lipgloss.Height(view) > tc.height {
+					t.Fatalf("view exceeds window: %dx%d", lipgloss.Width(view), lipgloss.Height(view))
+				}
+				for _, s := range cfg.Servers {
+					if !strings.Contains(view, s.Name) {
+						t.Fatalf("server %s hidden while all servers fit", s.Name)
+					}
+				}
+				next, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+				m = next.(model)
+			}
+		})
+	}
+}
+
+func TestPickerColumnNavigationAndResize(t *testing.T) {
+	cfg := &Config{}
+	for i := range 50 {
+		cfg.Servers = append(cfg.Servers, ServerConfig{Name: fmt.Sprintf("node-%02d", i), Host: "192.0.2.1", User: "root", Port: 22})
+	}
+	next, _ := initialModel(cfg, "").Update(tea.WindowSizeMsg{Width: 120, Height: 24})
+	m := next.(model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m = next.(model)
+	if m.filtered[m.cursor].Name != "node-21" {
+		t.Fatalf("right did not select adjacent column: %s", m.filtered[m.cursor].Name)
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	m = next.(model)
+	if m.cursor != 0 {
+		t.Fatalf("left did not return to first column: %d", m.cursor)
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = next.(model)
+	for _, size := range []tea.WindowSizeMsg{{Width: 40, Height: 10}, {Width: 80, Height: 24}, {Width: 120, Height: 24}} {
+		next, _ = m.Update(size)
+		m = next.(model)
+		view := m.View()
+		if !strings.Contains(view, "node-49") || lipgloss.Width(view) > size.Width || lipgloss.Height(view) > size.Height {
+			t.Fatalf("resize lost selection or overflowed window %dx%d: %s", size.Width, size.Height, view)
+		}
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("node-49")})
+	m = next.(model)
+	if len(m.filtered) != 1 || !strings.Contains(m.View(), "node-49") {
+		t.Fatal("filter did not retain matching server")
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(model)
+	if m.selected == nil || m.selected.Name != "node-49" {
+		t.Fatal("enter did not select the filtered server")
+	}
+}
+
 func TestSSHInvocation(t *testing.T) {
 	for _, backend := range []string{"key", "askpass"} {
 		t.Run(backend, func(t *testing.T) {

@@ -298,12 +298,20 @@ func (m *model) applyFilter() {
 	m.adjustViewport()
 }
 
-func (m *model) maxVisibleItems() int {
-	avail := m.height - 9
-	if m.width < 74 || m.height < 14 {
-		avail = m.height - 3
+func (m *model) listLayout() (rows, columns int) {
+	rows = max(1, m.height-9)
+	columns = 1
+	if m.width < 74 || m.height < 14 || len(m.filtered) > rows {
+		rows = max(1, m.height-3)
+		// Keep each column wide enough for a name and connection details.
+		columns = min(max(1, (len(m.filtered)+rows-1)/rows), max(1, (m.width+2)/34))
 	}
-	return min(18, max(1, avail))
+	return rows, columns
+}
+
+func (m *model) maxVisibleItems() int {
+	rows, columns := m.listLayout()
+	return rows * columns
 }
 
 func (m *model) adjustViewport() {
@@ -365,6 +373,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.adjustViewport()
 			return m, nil
 
+		case tea.KeyLeft, tea.KeyRight:
+			rows, columns := m.listLayout()
+			if columns > 1 && msg.Type == tea.KeyLeft && m.cursor >= rows {
+				m.cursor -= rows
+			} else if columns > 1 && msg.Type == tea.KeyRight && m.cursor+rows < len(m.filtered) {
+				m.cursor += rows
+			}
+			m.adjustViewport()
+			return m, nil
+
 		case tea.KeyEnter:
 			if m.width >= 16 && m.height >= 4 && len(m.filtered) > 0 && m.cursor < len(m.filtered) {
 				chosen := m.filtered[m.cursor]
@@ -397,7 +415,7 @@ func (m model) View() string {
 	if m.width < 16 || m.height < 4 {
 		return runewidth.Truncate("窗口过小，请放大", max(0, m.width), "")
 	}
-	if m.width < 74 || m.height < 14 {
+	if m.width < 74 || m.height < 14 || len(m.filtered) > m.height-9 {
 		return m.compactView()
 	}
 
@@ -485,27 +503,40 @@ func fitColumn(s string, width int) string {
 	return runewidth.FillRight(runewidth.Truncate(s, width, "…"), width)
 }
 
-// Keep target details visible in narrow terminals.
+// Use compact columns when the detailed list would hide servers.
 func (m model) compactView() string {
 	fit := func(s string) string { return runewidth.Truncate(s, m.width, "…") }
 	lines := []string{fit("⚡ SSH PICKER"), fit("❯ " + runewidth.TruncateLeft(m.filter, m.width-2, "…"))}
-	end := min(len(m.filtered), m.viewportTop+m.maxVisibleItems())
-	for i := m.viewportTop; i < end; i++ {
-		s := m.filtered[i]
-		address := fmt.Sprintf("%s@%s:%d", s.User, s.Host, s.Port)
-		addressWidth := min(runewidth.StringWidth(address), (m.width-3)*2/3)
-		nameWidth := m.width - addressWidth - 3
-		line := "  " + fitColumn(s.Name, nameWidth) + " " + runewidth.Truncate(address, addressWidth, "…")
-		if i == m.cursor {
-			line = "❯ " + strings.TrimPrefix(line, "  ")
-			line = lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Bold(true).Render(line)
+	rows, columns := m.listLayout()
+	columnWidth := (m.width - 2*(columns-1)) / columns
+	end := min(len(m.filtered), m.viewportTop+rows*columns)
+	for row := range min(rows, end-m.viewportTop) {
+		var line strings.Builder
+		for column := range columns {
+			i := m.viewportTop + column*rows + row
+			if i >= end {
+				break
+			}
+			if column > 0 {
+				line.WriteString("  ")
+			}
+			s := m.filtered[i]
+			address := fmt.Sprintf("%s@%s:%d", s.User, s.Host, s.Port)
+			addressWidth := min(runewidth.StringWidth(address), (columnWidth-3)*2/3)
+			nameWidth := columnWidth - addressWidth - 3
+			cell := "  " + fitColumn(s.Name, nameWidth) + " " + fitColumn(address, addressWidth)
+			if i == m.cursor {
+				cell = "❯ " + strings.TrimPrefix(cell, "  ")
+				cell = lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Bold(true).Render(cell)
+			}
+			line.WriteString(cell)
 		}
-		lines = append(lines, line)
+		lines = append(lines, line.String())
 	}
 	if len(m.filtered) == 0 {
 		lines = append(lines, fit("未找到服务器，Esc 清空"))
 	}
-	lines = append(lines, fit(fmt.Sprintf("↑↓ 选择 Enter 连接 Esc 返回 (%d/%d)", len(m.filtered), len(m.config.Servers))))
+	lines = append(lines, fit(fmt.Sprintf("↑↓←→ 选择 Enter 连接 Esc 返回 (%d/%d)", len(m.filtered), len(m.config.Servers))))
 	return strings.Join(lines, "\n")
 }
 
