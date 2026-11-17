@@ -24,22 +24,36 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version: "stable"
+          go-version-file: "go.mod"
           cache: true
 
       - name: Validate Version and Tag
+        id: version
         run: |
-          chmod +x ./scripts/read-version.sh
           VERSION="$(./scripts/read-version.sh VERSION)"
           EXPECTED_TAG="v${VERSION}"
           if [ "$GITHUB_REF_NAME" != "$EXPECTED_TAG" ]; then
             echo "触发标签 '$GITHUB_REF_NAME' 与 VERSION '${VERSION}' (预期: '$EXPECTED_TAG') 不一致" >&2
             exit 1
           fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract Changelog
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          ./scripts/extract-changelog.sh "$VERSION" CHANGELOG.md dist/notes.md
+
+      - name: Test and Vet
+        run: |
+          go vet ./...
+          go test ./...
+
       - name: Build and Package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p dist
-          VERSION="$(./scripts/read-version.sh VERSION)"
           PLATFORMS=(
             "darwin/arm64"
             "darwin/amd64"
@@ -57,12 +71,6 @@ jobs:
           done
           cd dist
           sha256sum sshtui_*.tar.gz > checksums.txt
-
-      - name: Extract Changelog
-        run: |
-          VERSION="$(./scripts/read-version.sh VERSION)"
-          chmod +x ./scripts/extract-changelog.sh
-          ./scripts/extract-changelog.sh "$VERSION" CHANGELOG.md dist/notes.md
 
       # softprops/action-gh-release v2.6.2 (https://github.com/softprops/action-gh-release/releases/tag/v2.6.2)
       - name: Create Release

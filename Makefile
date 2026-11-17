@@ -10,14 +10,15 @@ build:
 
 install: build
 	@mkdir -p "$(INSTALL_DIR)"
-	@set -eu; tmp_file="$$(mktemp "$(INSTALL_DIR)/.$(BINARY_NAME).XXXXXX")"; \
+	@set -eu; abs_dir="$$(CDPATH= cd -- "$(INSTALL_DIR)" && pwd)"; \
+	tmp_file="$$(mktemp "$$abs_dir/.$(BINARY_NAME).XXXXXX")"; \
 	trap 'rm -f "$$tmp_file"' EXIT; \
 	cp "$(BINARY_NAME)" "$$tmp_file" && \
 	chmod 755 "$$tmp_file" && \
-	mv -f "$$tmp_file" "$(INSTALL_DIR)/$(BINARY_NAME)" && \
-	ln -sf "$(INSTALL_DIR)/$(BINARY_NAME)" "$(INSTALL_DIR)/s" && \
-	trap - EXIT
-	@echo "✓ 安装成功！已写入 $(INSTALL_DIR)/$(BINARY_NAME) 并软链接为 $(INSTALL_DIR)/s"
+	mv -f "$$tmp_file" "$$abs_dir/$(BINARY_NAME)" && \
+	ln -sf "$$abs_dir/$(BINARY_NAME)" "$$abs_dir/s" && \
+	trap - EXIT; \
+	echo "✓ 安装成功！已写入 $$abs_dir/$(BINARY_NAME) 并软链接为 $$abs_dir/s"
 
 clean:
 	rm -f "$(BINARY_NAME)"

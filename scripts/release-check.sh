@@ -4,6 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="$("$SCRIPT_DIR/read-version.sh" VERSION)"
 
+TMP_NOTES="$(mktemp "${TMPDIR:-/tmp}/release-notes.XXXXXX")"
+trap 'rm -f "$TMP_NOTES"' EXIT
+"$SCRIPT_DIR/extract-changelog.sh" "$VERSION" CHANGELOG.md "$TMP_NOTES"
+
 # 检查当前分支，拒绝游离 HEAD (detached HEAD)
 BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
 if [ -z "$BRANCH" ]; then

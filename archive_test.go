@@ -104,6 +104,28 @@ func TestArchiveRejectsStaleSelection(t *testing.T) {
 	}
 }
 
+func TestArchiveMultilineErrorFitsWindow(t *testing.T) {
+	for _, size := range []tea.WindowSizeMsg{{Width: 80, Height: 24}, {Width: 40, Height: 10}} {
+		home, path := configFixture(t, "servers: [{name: node, host: 192.0.2.1}]\n")
+		t.Setenv("HOME", home)
+		cfg, _, err := loadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("servers:\n  - {name: node, port: bad}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		next, _ := initialModel(cfg, "").Update(size)
+		m := next.(model)
+		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyF2})
+		m = next.(model)
+		view := m.View()
+		if !strings.Contains(view, "保存失败") || lipgloss.Width(view) > size.Width || lipgloss.Height(view) > size.Height {
+			t.Fatalf("multiline error broke window %dx%d: %dx%d %q", size.Width, size.Height, lipgloss.Width(view), lipgloss.Height(view), view)
+		}
+	}
+}
+
 func TestPickerArchiveAndRestore(t *testing.T) {
 	for _, size := range []tea.WindowSizeMsg{{Width: 80, Height: 24}, {Width: 40, Height: 10}, {Width: 16, Height: 4}} {
 		home, _ := configFixture(t, "servers: [{name: node, host: 192.0.2.1}]\n")

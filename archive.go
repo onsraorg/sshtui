@@ -8,7 +8,7 @@ import (
 )
 
 func setServerArchived(target ServerConfig, archived bool) (*Config, error) {
-	err := editServersConfig(func(cfg *Config, servers *yaml.Node) error {
+	return editServersConfig(func(cfg *Config, servers *yaml.Node) error {
 		index := target.sourceIndex
 		var current *ServerConfig
 		for i := range cfg.Servers {
@@ -17,7 +17,7 @@ func setServerArchived(target ServerConfig, archived bool) (*Config, error) {
 				break
 			}
 		}
-		if current == nil || !reflect.DeepEqual(*current, target) || index >= len(servers.Content) {
+		if current == nil || !reflect.DeepEqual(*current, target) || index < 0 || index >= len(servers.Content) {
 			return fmt.Errorf("服务器配置已变化，请退出后重新打开")
 		}
 		entry := servers.Content[index]
@@ -46,9 +46,4 @@ func setServerArchived(target ServerConfig, archived bool) (*Config, error) {
 		)
 		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	cfg, _, err := loadConfig()
-	return cfg, err
 }

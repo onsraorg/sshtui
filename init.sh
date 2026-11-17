@@ -10,33 +10,56 @@ if [[ ! -r /etc/os-release ]] || ! command -v apt-get >/dev/null; then
   exit 1
 fi
 
+root_home="$(getent passwd root 2>/dev/null | cut -d: -f6 || true)"
+export HOME="${root_home:-/root}"
+
+append_line_if_missing() {
+  local line="$1" file="$2"
+  mkdir -p "$(dirname "$file")"
+  touch "$file"
+  if [[ -s "$file" && -n "$(tail -c1 "$file")" ]]; then
+    printf '\n' >> "$file"
+  fi
+  grep -qxF -- "$line" "$file" || printf '%s\n' "$line" >> "$file"
+}
+
 export DEBIAN_FRONTEND=noninteractive
+dpkg_opts=(-o 'Dpkg::Options::=--force-confdef' -o 'Dpkg::Options::=--force-confold')
 apt-get update
-apt-get install -y vim ca-certificates curl wget git unzip xz-utils htop tmux jq zsh build-essential clang pkg-config libssl-dev python3 python3-pip python3-venv python3-dev iproute2 iputils-ping dnsutils
-apt-get upgrade -y
+apt-get install -y "${dpkg_opts[@]}" vim ca-certificates curl wget git unzip xz-utils htop tmux jq zsh build-essential clang pkg-config libssl-dev python3 python3-pip python3-venv python3-dev iproute2 iputils-ping dnsutils
+apt-get upgrade -y "${dpkg_opts[@]}"
 
 # 安装到运行脚本的 root 用户。
 if ! command -v docker >/dev/null; then
   curl -fsSL https://get.docker.com | sh
 fi
 if [[ ! -d "$HOME/.oh-my-zsh" ]]; then
-  RUNZSH=no CHSH=no sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" -- --unattended
+  omz_installer="$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+  RUNZSH=no CHSH=no sh -c "$omz_installer" -- --unattended
 fi
 chsh -s "$(command -v zsh)" root
-grep -qxF "alias dk='docker'" "$HOME/.zshrc" || echo "alias dk='docker'" >> "$HOME/.zshrc"
+append_line_if_missing "alias dk='docker'" "$HOME/.zshrc"
 
-if ! grep -qE '^\* soft nofile 327680$' /etc/security/limits.conf; then
-  echo '* soft nofile 327680' >> /etc/security/limits.conf
-fi
-if ! grep -qE '^\* hard nofile 655360$' /etc/security/limits.conf; then
-  echo '* hard nofile 655360' >> /etc/security/limits.conf
-fi
+mkdir -p /etc/security/limits.d
+cat > /etc/security/limits.d/99-init.conf <<'EOF'
+* soft nofile 327680
+* hard nofile 655360
+root soft nofile 327680
+root hard nofile 655360
+EOF
+
+apply_sysctl() {
+  local conf="$1"
+  if ! sysctl -p "$conf"; then
+    echo "警告: 应用 $conf 失败（可能处于容器或受限内核中），继续执行。" >&2
+  fi
+}
 
 cat > /etc/sysctl.d/99-init.conf <<'EOF'
 net.core.rmem_max=600000000
 net.core.wmem_max=600000000
-net.ipv4.tcp_congestion_control=bbr
 net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
 net.core.somaxconn=65535
 net.ipv4.tcp_max_syn_backlog=65535
 net.core.netdev_max_backlog=65535
@@ -47,7 +70,8 @@ vm.overcommit_memory=1
 fs.inotify.max_user_watches=524288
 fs.file-max=2097152
 EOF
-sysctl -p /etc/sysctl.d/99-init.conf
+modprobe tcp_bbr 2>/dev/null || true
+apply_sysctl /etc/sysctl.d/99-init.conf
 
 mem_kib=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
 if [[ ! $mem_kib =~ ^[0-9]+$ ]]; then
@@ -69,7 +93,7 @@ if (( mem_kib < 2 * 1024 * 1024 )); then
     swapon /swapfile
     grep -qE '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
     echo 'vm.swappiness=10' > /etc/sysctl.d/99-swap.conf
-    sysctl -p /etc/sysctl.d/99-swap.conf
+    apply_sysctl /etc/sysctl.d/99-swap.conf
   fi
 else
   echo '物理内存不低于 2 GiB，跳过创建 swap。'
@@ -79,10 +103,12 @@ export NVM_DIR="$HOME/.nvm"
 if [[ ! -s "$NVM_DIR/nvm.sh" ]]; then
   curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.7/install.sh | PROFILE=/dev/null bash
 fi
-set +u
-. "$NVM_DIR/nvm.sh"
-nvm install --lts
-nvm alias default 'lts/*'
-set -u
-grep -qxF 'export NVM_DIR="$HOME/.nvm"' "$HOME/.zshrc" || echo 'export NVM_DIR="$HOME/.nvm"' >> "$HOME/.zshrc"
-grep -qxF '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"' "$HOME/.zshrc" || echo '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"' >> "$HOME/.zshrc"
+set +euo pipefail
+. "$NVM_DIR/nvm.sh" && nvm install --lts && nvm alias default 'lts/*'
+nvm_status=$?
+set -euo pipefail
+if (( nvm_status != 0 )); then
+  exit "$nvm_status"
+fi
+append_line_if_missing 'export NVM_DIR="$HOME/.nvm"' "$HOME/.zshrc"
+append_line_if_missing '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"' "$HOME/.zshrc"

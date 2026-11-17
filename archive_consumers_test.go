@@ -38,6 +38,7 @@ func TestArchivedServersExcludedFromConsumers(t *testing.T) {
 }
 
 func TestCLIExcludesArchivedServers(t *testing.T) {
+	t.Parallel()
 	home, _ := configFixture(t, "servers:\n  - {name: live, host: 192.0.2.1}\n  - {name: retired, host: 192.0.2.2, archived: true, password: archive-secret}\n")
 	for _, arg := range []string{"-l", "--ansible", "--list", "--ansible-ini"} {
 		out, err := cliCommand(t, map[string]string{"HOME": home}, arg).CombinedOutput()

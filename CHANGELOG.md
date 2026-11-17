@@ -1,5 +1,13 @@
 # 更新记录
 
+## 0.5.0 — 2026-11-17
+
+- 新增服务器初始化脚本 `init.sh`（基于 `apt` 的 Debian/Ubuntu `root` 环境配置：常用工具、Docker、Oh My Zsh、`root` 与通配符 `nofile` 限制、内核参数/BBR、低内存自动创建 `/swapfile` 与 `nvm`/Node.js LTS），支持非交互 `dpkg` 选项、受限内核回退与 `set -euo pipefail` 安全执行。
+- 修复并完善 TUI 与配置校验：修复筛选文本显示、空格输入、视口裁剪与多行状态溢出，规范显示 IPv6 端点地址，拦截显式 `port: 0` 并校验 `default` 配置，统一空白分组为 `Default`。
+- 改进快速添加与 Ansible 导出：保留密码首尾空格、校验多余位置参数并支持带区域标识符的 IPv6 地址，统一 `s add`/`s -e`/`s -a`/`--help` 说明，拦截含空白字符的 Ansible INI 分组名并消除配置保存重复读写。
+- 加固 SSH 连接与凭据隔离：过滤预置 `SSH_ASKPASS_PROMPT`、支持长临时目录套接字路径回退、兼容 macOS 软链接与 Linux `(deleted)` 可执行文件、收敛协程生命周期；移除 `stdout`/`stderr` 代理管道以保留子进程 TTY，改为基于 `stderr` 修改时间的单行连接提示，并异步设置 macOS Ghostty 标签且避免应用退出后误拉起。
+- 修复 `README.md` 代码块未闭合、`Makefile` 相对安装路径软链接及发布前未校验 `CHANGELOG.md` 的问题，规范 `go.mod`/`go.sum` 并更新 GitHub 发布工作流（使用 `go.mod` 指定 Go 版本并执行 `go vet` 与 `go test`）。
+
 ## 0.4.0 — 2026-11-14
 
 - 新增服务器归档：F2 归档/恢复，F3 显示/隐藏归档；归档项灰色标记，恢复前不能连接。

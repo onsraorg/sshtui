@@ -22,7 +22,7 @@
 - macOS 或 Linux。
 - `ssh`，通常由系统自带。
 - 密码自动填入需要 OpenSSH 8.4 或更新版本。
-- `ansible`：仅批量执行和 inventory 验证需要。
+- `ansible`：仅批量执行和 inventory 验证需要；对密码认证主机执行 `s run` 时还需系统已安装 `sshpass`。
 - Go 1.27 或更新版本：仅从源码构建需要。
 
 ## 安装
@@ -76,14 +76,14 @@ s dev-app
 | `s` | 打开交互式服务器选择器 |
 | `s <筛选词>` | 唯一名称匹配时直连，否则打开过滤后的列表 |
 | `s -e` | 使用 `$EDITOR` 或 `vim` 编辑配置 |
-| `s -e <参数>` / `s -a` | 快速解析并追加服务器到配置（如 `s -e 1.2.3.4 22 mypass`） |
+| `s -e <参数>` / `s -a <参数>` / `s add <参数>` | 快速解析并追加服务器到配置（如 `s -e 1.2.3.4 22 mypass`） |
 | `s -l` | 以纯文本列出服务器 |
 | `s -p` | 输出当前配置文件路径 |
 | `s --version` / `s -v` | 输出版本 |
 | `s --ansible` | 输出 Ansible 动态 JSON inventory |
 | `s --ansible-ini` | 输出 Ansible INI inventory |
-| `s run "uptime"` | 在全部服务器执行命令 |
-| `s run -g production "df -h"` | 在指定分组执行命令 |
+| `s run "uptime"` / `s exec "uptime"` | 在全部服务器执行命令 |
+| `s run -g production "df -h"` | 在指定分组执行命令（`exec` 为 `run` 的别名） |
 
 筛选词包含空格时必须使用引号，例如 `s "prod db"`。多余的位置参数会被拒绝，避免静默连接错误主机。
 ### 快速添加服务器
@@ -177,6 +177,7 @@ ServerAliveInterval=15
 ServerAliveCountMax=30
 TCPKeepAlive=no
 IPQoS=none
+```
 
 服务器自己的 `args` 位于这些默认值之前。OpenSSH 对相关选项采用第一个值，因此可按服务器覆盖默认值：
 
@@ -188,9 +189,9 @@ args: ["-o", "ConnectTimeout=30"]
 
 ## 密码认证
 
-密码连接统一通过 ASKPASS：在权限为 `0700` 的临时目录内建立 Unix socket，仅向目标 SSH 直接启动且通过进程身份校验的 helper 提供密码。代理 SSH 的 helper 和无关进程不会获得目标密码；跳板机应单独配置密钥或其他认证方式。
+交互式密码连接统一通过 ASKPASS：在权限为 `0700` 的临时目录内建立 Unix socket，仅向目标 SSH 直接启动且通过进程身份校验的 helper 提供密码。代理 SSH 的 helper 和无关进程不会获得目标密码；跳板机应单独配置密钥或其他认证方式。
 
-ASKPASS 只回答 SSH 的密码提示，不回答主机确认或私钥 passphrase，也不会在登录后的远端程序再次显示 `password:` 时自动输入。不再使用无法区分目标和跳板机提示的 `sshpass`。
+ASKPASS 只回答 SSH 的密码提示，不回答主机确认或私钥 passphrase，也不会在登录后的远端程序再次显示 `password:` 时自动输入。交互连接不再使用无法区分目标和跳板机提示的 `sshpass`；若使用 `s run` 或 Ansible inventory 对密码认证主机批量执行命令，仍会由 Ansible 导出 `ansible_password` / `ansible_ssh_pass` 并依赖系统 `sshpass` 完成认证。
 
 配置文件和导出的 inventory 可能包含明文密码。不要提交 `servers.yaml`，导出 INI 时应限制权限：
 
@@ -214,7 +215,7 @@ s run "uptime"
 s run -g production "df -h"
 ```
 
-主机名称必须唯一。`all` 和 `_meta` 是保留分组名。INI 主机名不能包含 `[]`、冒号或换行；遇到这类名称请使用动态 JSON inventory。
+主机名称必须唯一。`all` 和 `_meta` 是保留分组名。INI 主机名不能包含 `[]`、冒号或换行，INI 分组名不能包含空白字符；遇到这类名称请使用动态 JSON inventory。对配置为密码认证的主机，导出的 JSON/INI inventory 包含明文 `ansible_password` / `ansible_ssh_pass`，`s run` 会依赖 Ansible 与 `sshpass` 执行连接。
 
 ## Ghostty
 
@@ -227,6 +228,16 @@ s run -g production "df -h"
 ```ini
 term = xterm-256color
 ```
+
+## 服务器初始化脚本
+
+仓库根目录提供 `init.sh`，用于基于 `apt` 的 Debian/Ubuntu 服务器 `root` 环境初始化：
+
+```bash
+sudo ./init.sh
+```
+
+脚本会更新系统并安装常用工具与编译依赖、按需安装 Docker、为 `root` 配置 Oh My Zsh、设置 `nofile` 与网络/BBR 内核参数、在物理内存低于 2 GiB 时按需创建 2 GiB `/swapfile`，并通过 `nvm` 安装 Node.js LTS。
 
 ## 开发
 

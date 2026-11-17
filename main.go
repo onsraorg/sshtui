@@ -11,6 +11,7 @@ import (
 	"io"
 	"maps"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -20,9 +21,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -40,7 +43,7 @@ type ServerConfig struct {
 	Name        string   `yaml:"name"`
 	Group       string   `yaml:"group"`
 	Host        string   `yaml:"host"`
-	Port        int      `yaml:"port"`
+	Port        int      `yaml:"port,omitempty"`
 	User        string   `yaml:"user"`
 	Auth        string   `yaml:"auth"` // "key" or "password"
 	Key         string   `yaml:"key"`
@@ -54,7 +57,7 @@ type ServerConfig struct {
 type Config struct {
 	Default struct {
 		User                string `yaml:"user"`
-		Port                int    `yaml:"port"`
+		Port                int    `yaml:"port,omitempty"`
 		Key                 string `yaml:"key"`
 		ServerAliveInterval int    `yaml:"server_alive_interval"`  // Keepalive interval in seconds; defaults to 15.
 		ServerAliveCountMax int    `yaml:"server_alive_count_max"` // Failed keepalive limit; defaults to 30.
@@ -196,14 +199,96 @@ func loadConfig() (*Config, string, error) {
 		return nil, "", err
 	}
 	defer f.Close()
+	raw, err := io.ReadAll(f)
+	if err != nil {
+		return nil, "", fmt.Errorf("读取配置文件失败: %w", err)
+	}
+	cfg, err := decodeConfig(raw)
+	if err != nil {
+		return nil, "", err
+	}
+	return cfg, cfgPath, nil
+}
+
+func unwrapAlias(n *yaml.Node) *yaml.Node {
+	for n != nil && n.Kind == yaml.AliasNode {
+		n = n.Alias
+	}
+	return n
+}
+
+func mappingLookup(m *yaml.Node, key string) *yaml.Node {
+	m = unwrapAlias(m)
+	if m == nil || m.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			return m.Content[i+1]
+		}
+	}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].ShortTag() != "!!merge" && m.Content[i].Value != "<<" {
+			continue
+		}
+		merged := unwrapAlias(m.Content[i+1])
+		if merged == nil {
+			continue
+		}
+		if merged.Kind == yaml.MappingNode {
+			if found := mappingLookup(merged, key); found != nil {
+				return found
+			}
+		} else if merged.Kind == yaml.SequenceNode {
+			for _, elem := range merged.Content {
+				if found := mappingLookup(elem, key); found != nil {
+					return found
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func isExplicitZeroPort(m *yaml.Node) bool {
+	val := unwrapAlias(mappingLookup(m, "port"))
+	if val == nil || val.Kind != yaml.ScalarNode || val.ShortTag() != "!!int" {
+		return false
+	}
+	var port int
+	return val.Decode(&port) == nil && port == 0
+}
+
+func decodeConfig(raw []byte) (*Config, error) {
 	var cfg Config
-	decoder := yaml.NewDecoder(f)
+	decoder := yaml.NewDecoder(bytes.NewReader(raw))
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&cfg); err != nil {
-		return nil, "", fmt.Errorf("解析 YAML 配置文件失败: %w", err)
+		return nil, fmt.Errorf("解析 YAML 配置文件失败: %w", err)
 	}
 	if err := decoder.Decode(new(yaml.Node)); err != io.EOF {
-		return nil, "", fmt.Errorf("配置只允许一个 YAML 文档")
+		return nil, fmt.Errorf("配置只允许一个 YAML 文档")
+	}
+
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("解析 YAML 配置文件失败: %w", err)
+	}
+	var defaultNode, serversNode *yaml.Node
+	if len(doc.Content) > 0 {
+		root := unwrapAlias(doc.Content[0])
+		defaultNode = unwrapAlias(mappingLookup(root, "default"))
+		serversNode = unwrapAlias(mappingLookup(root, "servers"))
+	}
+
+	if isExplicitZeroPort(defaultNode) || (cfg.Default.Port != 0 && (cfg.Default.Port < 1 || cfg.Default.Port > 65535)) {
+		return nil, fmt.Errorf("default.port 必须在 1–65535 之间")
+	}
+	if strings.ContainsRune(cfg.Default.User, 0) || strings.ContainsRune(cfg.Default.Key, 0) {
+		return nil, fmt.Errorf("default 配置不能包含 NUL 字符")
+	}
+	if strings.IndexFunc(cfg.Default.User, unicode.IsControl) >= 0 {
+		return nil, fmt.Errorf("default.user 不能包含控制字符")
 	}
 
 	if cfg.Default.ServerAliveInterval <= 0 {
@@ -215,10 +300,13 @@ func loadConfig() (*Config, string, error) {
 
 	for i := range cfg.Servers {
 		s := &cfg.Servers[i]
+		if serversNode != nil && serversNode.Kind == yaml.SequenceNode && i < len(serversNode.Content) && isExplicitZeroPort(serversNode.Content[i]) {
+			return nil, fmt.Errorf("服务器 %q 的 port 必须在 1–65535 之间", s.Name)
+		}
 		s.sourceIndex = i
 		s.User = cmp.Or(s.User, cfg.Default.User, "root")
 		s.Port = cmp.Or(s.Port, cfg.Default.Port, 22)
-		s.Group = cmp.Or(s.Group, "Default")
+		s.Group = cmp.Or(strings.TrimSpace(s.Group), "Default")
 		if s.Auth == "" {
 			if s.Password != "" {
 				s.Auth = "password"
@@ -230,24 +318,24 @@ func loadConfig() (*Config, string, error) {
 			s.Key = cmp.Or(s.Key, cfg.Default.Key)
 		}
 		if s.Host == "" || s.Port < 1 || s.Port > 65535 {
-			return nil, "", fmt.Errorf("服务器 %q 的 host 不能为空，port 必须在 1–65535 之间", s.Name)
+			return nil, fmt.Errorf("服务器 %q 的 host 不能为空，port 必须在 1–65535 之间", s.Name)
 		}
 		if s.Auth != "key" && s.Auth != "password" {
-			return nil, "", fmt.Errorf("服务器 %q 的 auth 必须是 key 或 password", s.Name)
+			return nil, fmt.Errorf("服务器 %q 的 auth 必须是 key 或 password", s.Name)
 		}
 		fields := append([]string{s.Name, s.Group, s.Host, s.User, s.Key}, s.Args...)
 		for _, field := range fields {
 			if strings.ContainsRune(field, 0) {
-				return nil, "", fmt.Errorf("服务器 %q 的配置不能包含 NUL 字符", s.Name)
+				return nil, fmt.Errorf("服务器 %q 的配置不能包含 NUL 字符", s.Name)
 			}
 		}
 		for _, field := range []string{s.Name, s.Group, s.Host, s.User} {
 			if strings.IndexFunc(field, unicode.IsControl) >= 0 {
-				return nil, "", fmt.Errorf("服务器 %q 的显示字段不能包含控制字符", s.Name)
+				return nil, fmt.Errorf("服务器 %q 的显示字段不能包含控制字符", s.Name)
 			}
 		}
 		if err := validatePassword(s.Password); err != nil {
-			return nil, "", fmt.Errorf("服务器 %q: %w", s.Name, err)
+			return nil, fmt.Errorf("服务器 %q: %w", s.Name, err)
 		}
 	}
 
@@ -255,7 +343,7 @@ func loadConfig() (*Config, string, error) {
 		return cmp.Or(strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name)), strings.Compare(a.Name, b.Name))
 	})
 
-	return &cfg, cfgPath, nil
+	return &cfg, nil
 }
 
 type model struct {
@@ -272,10 +360,22 @@ type model struct {
 	status       string
 }
 
+func sanitizeFilter(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return ' '
+		}
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 func initialModel(cfg *Config, initialFilter string) model {
 	m := model{
 		config:      cfg,
-		filter:      initialFilter,
+		filter:      sanitizeFilter(initialFilter),
 		viewportTop: 0,
 		height:      24,
 		width:       80,
@@ -329,6 +429,12 @@ func (m *model) adjustViewport() {
 	} else if m.cursor >= m.viewportTop+visible {
 		m.viewportTop = m.cursor - visible + 1
 	}
+	if maxTop := len(m.filtered) - visible; m.viewportTop > maxTop {
+		m.viewportTop = maxTop
+	}
+	if m.viewportTop < 0 {
+		m.viewportTop = 0
+	}
 }
 
 func (m model) Init() tea.Cmd {
@@ -353,7 +459,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			target := m.filtered[m.cursor]
 			cfg, err := setServerArchived(target, !target.Archived)
 			if err != nil {
-				m.status = "保存失败: " + err.Error()
+				m.status = strings.Join(strings.Fields(sanitizeFilter("保存失败: "+err.Error())), " ")
 				return m, nil
 			}
 			m.config = cfg
@@ -430,9 +536,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
+		case tea.KeySpace:
+			if !msg.Alt {
+				m.filter += " "
+				m.applyFilter()
+			}
+			return m, nil
+
 		case tea.KeyRunes:
-			m.filter += string(msg.Runes)
-			m.applyFilter()
+			if !msg.Alt {
+				m.filter += sanitizeFilter(string(msg.Runes))
+				m.applyFilter()
+			}
 			return m, nil
 		}
 	}
@@ -466,7 +581,7 @@ func (m model) View() string {
 		Width(72)
 
 	searchPrompt := lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render("❯ Filter: ")
-	searchText := lipgloss.NewStyle().Foreground(textColor).Render(runewidth.TruncateLeft(m.filter, 56, "…"))
+	searchText := lipgloss.NewStyle().Foreground(textColor).Render(truncateLeft(m.filter, 56))
 	cursorBlock := lipgloss.NewStyle().Foreground(primaryColor).Render("▋")
 	searchBar := headerBox.Render(searchPrompt + searchText + cursorBlock)
 
@@ -511,7 +626,7 @@ func (m model) View() string {
 			content := fmt.Sprintf("%s %s %s %s",
 				lipgloss.NewStyle().Foreground(accentColor).Bold(isSelected).Render(fitColumn("["+s.Group+"]", 9)),
 				lipgloss.NewStyle().Foreground(nameColor).Bold(isSelected).Render(fitColumn(s.Name, 20)),
-				lipgloss.NewStyle().Foreground(connColor).Render(fitColumn(fmt.Sprintf("%s@%s:%d", s.User, s.Host, s.Port), 23)),
+				lipgloss.NewStyle().Foreground(connColor).Render(fitColumn(formatEndpoint(s.User, s.Host, s.Port), 23)),
 				authBadge)
 			line := prefix + rowStyle.Render(content)
 			b.WriteString(line + "\n")
@@ -524,8 +639,71 @@ func (m model) View() string {
 	return b.String()
 }
 
+func formatEndpoint(user, host string, port int) string {
+	return fmt.Sprintf("%s@%s", user, net.JoinHostPort(host, strconv.Itoa(port)))
+}
+
 func fitColumn(s string, width int) string {
 	return runewidth.FillRight(runewidth.Truncate(s, width, "…"), width)
+}
+
+func truncateLeft(s string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	if runewidth.StringWidth(s) <= maxWidth {
+		return s
+	}
+	if maxWidth == 1 {
+		return "…"
+	}
+	limit := maxWidth - 1
+	start := len(s)
+	nonZero := 0
+	for start > 0 && nonZero <= limit {
+		r, size := utf8.DecodeLastRuneInString(s[:start])
+		start -= size
+		if r == '\u200d' {
+			if start > 0 {
+				_, prevSize := utf8.DecodeLastRuneInString(s[:start])
+				start -= prevSize
+			}
+			continue
+		}
+		if runewidth.RuneWidth(r) > 0 {
+			nonZero++
+		}
+	}
+	for start > 0 && runewidth.StringWidth(s[start:]) <= limit {
+		r, size := utf8.DecodeLastRuneInString(s[:start])
+		start -= size
+		if r == '\u200d' && start > 0 {
+			_, prevSize := utf8.DecodeLastRuneInString(s[:start])
+			start -= prevSize
+		}
+	}
+	tail := s[start:]
+	for len(tail) > 0 && runewidth.StringWidth(tail) > limit {
+		_, size := utf8.DecodeRuneInString(tail)
+		tail = tail[size:]
+		for len(tail) > 0 {
+			next, nextSize := utf8.DecodeRuneInString(tail)
+			if next == '\u200d' {
+				tail = tail[nextSize:]
+				if len(tail) > 0 {
+					_, afterSize := utf8.DecodeRuneInString(tail)
+					tail = tail[afterSize:]
+				}
+				continue
+			}
+			if runewidth.RuneWidth(next) == 0 {
+				tail = tail[nextSize:]
+				continue
+			}
+			break
+		}
+	}
+	return "…" + tail
 }
 
 // Use compact columns when the detailed list would hide servers.
@@ -535,7 +713,7 @@ func (m model) compactView() string {
 	if m.showArchived {
 		title = "SSH · F2 归档/恢复 F3 隐藏归档"
 	}
-	lines := []string{fit(title), fit("❯ " + runewidth.TruncateLeft(m.filter, m.width-2, "…"))}
+	lines := []string{fit(title), fit("❯ " + truncateLeft(m.filter, max(0, m.width-2)))}
 	rows, columns := m.listLayout()
 	columnWidth := (m.width - 2*(columns-1)) / columns
 	end := min(len(m.filtered), m.viewportTop+rows*columns)
@@ -550,7 +728,7 @@ func (m model) compactView() string {
 				line.WriteString("  ")
 			}
 			s := m.filtered[i]
-			address := fmt.Sprintf("%s@%s:%d", s.User, s.Host, s.Port)
+			address := formatEndpoint(s.User, s.Host, s.Port)
 			if s.Archived {
 				address = "[已归档]"
 			}
@@ -580,7 +758,7 @@ func (m model) compactView() string {
 
 func (m model) footer() string {
 	if m.status != "" {
-		return m.status
+		return strings.Join(strings.Fields(sanitizeFilter(m.status)), " ")
 	}
 	return fmt.Sprintf("↑↓←→ 选择 Enter 连接 Esc 返回 (%d/%d)", len(m.filtered), len(m.config.Servers))
 }
@@ -619,8 +797,16 @@ func runWithAskpass(sshPath string, args []string, password string, env []string
 	if err != nil {
 		return err
 	}
+	if resolved, err := filepath.EvalSymlinks(self); err == nil {
+		self = resolved
+	}
+	expectedInfo, _ := os.Stat(self)
 	// Keep Unix socket paths below the platform's roughly 104-byte limit.
-	dir, err := os.MkdirTemp(os.TempDir(), "sshtui-askpass-")
+	baseDir := os.TempDir()
+	if len(filepath.Join(baseDir, "sshtui-askpass-0000000000", "password.sock")) >= 100 {
+		baseDir = "/tmp"
+	}
+	dir, err := os.MkdirTemp(baseDir, "sshtui-askpass-")
 	if err != nil {
 		return err
 	}
@@ -630,12 +816,18 @@ func runWithAskpass(sshPath string, args []string, password string, env []string
 	if err != nil {
 		return err
 	}
-	defer listener.Close()
 
 	pidChan := make(chan int, 1)
-	defer close(pidChan)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	defer func() {
+		close(pidChan)
+		_ = listener.Close()
+		wg.Wait()
+	}()
 
 	go func() {
+		defer wg.Done()
 		expectedPID, ok := <-pidChan
 		if !ok || expectedPID <= 0 {
 			return
@@ -645,18 +837,21 @@ func runWithAskpass(sshPath string, args []string, password string, env []string
 			if err != nil {
 				return
 			}
-			if isAuthorizedPeer(conn, expectedPID, self) {
+			if isAuthorizedPeer(conn, expectedPID, self, expectedInfo) {
+				_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 				_, _ = io.WriteString(conn, password+"\n")
 			}
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 	cmd := exec.Command(sshPath, args...)
 	for _, entry := range env {
 		key, _, _ := strings.Cut(entry, "=")
-		if key != "SSH_ASKPASS" && key != "SSH_ASKPASS_REQUIRE" && key != "SSHTUI_ASKPASS_SOCKET" && key != "SSHTUI_ASKPASS_HELPER" {
-			cmd.Env = append(cmd.Env, entry)
+		switch key {
+		case "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "SSH_ASKPASS_PROMPT", "SSHTUI_ASKPASS_SOCKET", "SSHTUI_ASKPASS_HELPER":
+			continue
 		}
+		cmd.Env = append(cmd.Env, entry)
 	}
 	cmd.Env = append(cmd.Env, "SSH_ASKPASS="+self, "SSH_ASKPASS_REQUIRE=force", "SSHTUI_ASKPASS_SOCKET="+path, "SSHTUI_ASKPASS_HELPER=1")
 	return runSSH(cmd, func(pid int) {
@@ -664,7 +859,7 @@ func runWithAskpass(sshPath string, args []string, password string, env []string
 	})
 }
 
-func isAuthorizedPeer(conn net.Conn, expectedPID int, expectedExe string) bool {
+func isAuthorizedPeer(conn net.Conn, expectedPID int, expectedExe string, expectedInfo os.FileInfo) bool {
 	if expectedPID <= 0 {
 		return false
 	}
@@ -680,20 +875,16 @@ func isAuthorizedPeer(conn net.Conn, expectedPID int, expectedExe string) bool {
 	if err != nil {
 		return false
 	}
-	if infoPeer, err1 := os.Stat(exePath); err1 == nil {
-		if infoExp, err2 := os.Stat(expectedExe); err2 == nil && os.SameFile(infoPeer, infoExp) {
+	if expectedInfo != nil {
+		if infoPeer, err := os.Stat(exePath); err == nil && os.SameFile(infoPeer, expectedInfo) {
 			return true
 		}
-	}
-	realExpected, err := filepath.EvalSymlinks(expectedExe)
-	if err != nil {
-		realExpected = expectedExe
 	}
 	realPeer, err := filepath.EvalSymlinks(exePath)
 	if err != nil {
 		realPeer = exePath
 	}
-	return realPeer == realExpected
+	return realPeer == expectedExe
 }
 
 func runSSH(cmd *exec.Cmd, onStart ...func(pid int)) error {
@@ -704,22 +895,27 @@ func runSSH(cmd *exec.Cmd, onStart ...func(pid int)) error {
 	}
 	defer restoreTerminal(terminalState)
 	if progress := startConnectionProgress(); progress != nil {
-		defer progress.stop(true)
-		cmd.Stdout = connectionOutput{progress, os.Stdout}
-		cmd.Stderr = connectionOutput{progress, os.Stderr}
+		defer progress.finish()
 	}
 	signals := make(chan os.Signal, 4)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGWINCH)
-	defer signal.Stop(signals)
 	if err := cmd.Start(); err != nil {
+		signal.Stop(signals)
 		return err
 	}
 	if len(onStart) > 0 && onStart[0] != nil && cmd.Process != nil {
 		onStart[0](cmd.Process.Pid)
 	}
 	done := make(chan struct{})
-	defer close(done)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	defer func() {
+		signal.Stop(signals)
+		close(done)
+		wg.Wait()
+	}()
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case sig := <-signals:
@@ -733,9 +929,9 @@ func runSSH(cmd *exec.Cmd, onStart ...func(pid int)) error {
 }
 
 type connectionProgress struct {
-	mu     sync.Mutex
-	active bool
-	done   chan struct{}
+	done  chan struct{}
+	wg    sync.WaitGroup
+	drawn atomic.Bool
 }
 
 func startConnectionProgress() *connectionProgress {
@@ -749,15 +945,20 @@ func startConnectionProgress() *connectionProgress {
 	if err != nil {
 		return nil
 	}
-	p := &connectionProgress{active: true, done: make(chan struct{})}
+	var lastMtime time.Time
+	if info, err := os.Stderr.Stat(); err == nil {
+		lastMtime = info.ModTime()
+	}
+	p := &connectionProgress{done: make(chan struct{})}
 	start := time.Now()
 	style := lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8"))
 	frames := []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-	fmt.Fprintln(os.Stderr, style.Render("  ⠋ 正在连接 · 已等待 0.0s"))
+	p.wg.Add(1)
 	go func() {
+		defer p.wg.Done()
 		ticker := time.NewTicker(80 * time.Millisecond)
 		defer ticker.Stop()
-		for frame := 1; ; frame++ {
+		for frame := 0; ; frame++ {
 			select {
 			case <-p.done:
 				return
@@ -765,41 +966,33 @@ func startConnectionProgress() *connectionProgress {
 				current, err := term.GetState(int(os.Stdin.Fd()))
 				if err != nil || *current != *state {
 					// Password prompts use /dev/tty directly; leave their cursor untouched.
-					p.stop(false)
+					p.drawn.Store(false)
 					return
 				}
-				p.mu.Lock()
-				if p.active {
-					line := fmt.Sprintf("  %c 正在连接 · 已等待 %.1fs", frames[frame%len(frames)], time.Since(start).Seconds())
-					fmt.Fprintf(os.Stderr, "\x1b7\x1b[1A\r\x1b[2K%s\x1b8", style.Render(line))
+				if p.drawn.Load() && !lastMtime.IsZero() {
+					if info, err := os.Stderr.Stat(); err == nil && !info.ModTime().Equal(lastMtime) {
+						p.drawn.Store(false)
+						return
+					}
 				}
-				p.mu.Unlock()
+				line := fmt.Sprintf("  %c 正在连接 · 已等待 %.1fs", frames[frame%len(frames)], time.Since(start).Seconds())
+				fmt.Fprintf(os.Stderr, "\r\x1b[2K%s\r", style.Render(line))
+				p.drawn.Store(true)
+				if info, err := os.Stderr.Stat(); err == nil {
+					lastMtime = info.ModTime()
+				}
 			}
 		}
 	}()
 	return p
 }
 
-func (p *connectionProgress) stop(clear bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.active {
-		p.active = false
-		close(p.done)
-		if clear {
-			fmt.Fprint(os.Stderr, "\x1b[1A\r\x1b[2K")
-		}
+func (p *connectionProgress) finish() {
+	close(p.done)
+	p.wg.Wait()
+	if p.drawn.Load() {
+		fmt.Fprint(os.Stderr, "\r\x1b[2K")
 	}
-}
-
-type connectionOutput struct {
-	progress *connectionProgress
-	output   io.Writer
-}
-
-func (w connectionOutput) Write(data []byte) (int, error) {
-	w.progress.stop(true)
-	return w.output.Write(data)
 }
 
 // Clear nested Kitty modes on both screens; their keyboard stacks are independent.
@@ -823,7 +1016,7 @@ func restoreTerminal(state *term.State) {
 }
 
 func ghosttyScript(script string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "osascript", append([]string{"-e", script, "--"}, args...)...).CombinedOutput()
 	if err != nil {
@@ -848,39 +1041,66 @@ func pinGhosttyTabTitle(s *ServerConfig) func() {
 	}, inventoryName(*s))
 	// Identify this surface by a unique OSC title, even if the user switches tabs.
 	marker := fmt.Sprintf("sshtui-%d-%d", os.Getpid(), time.Now().UnixNano())
-	_, err = fmt.Fprintf(tty, "\x1b]2;%s\x1b\\", marker)
-	if err != nil {
+	if _, err := fmt.Fprintf(tty, "\x1b]2;%s\x1b\\", marker); err != nil {
 		tty.Close()
 		return nil
 	}
-	id, err := ghosttyScript(`on run argv
-	tell application "Ghostty"
-		repeat 50 times
-			set matches to every terminal whose name is (item 1 of argv)
-			if (count of matches) > 0 then
-				set targetTerminal to item 1 of matches
-				if not (perform action ("set_tab_title:" & item 2 of argv) on targetTerminal) then error "Cannot set tab title"
-				return id of targetTerminal
-			end if
-			delay 0.02
-		end repeat
-		error "Cannot find current Ghostty terminal"
-	end tell
+
+	type pinResult struct {
+		id  string
+		err error
+	}
+	var mu sync.Mutex
+	active := true
+	resCh := make(chan pinResult, 1)
+
+	go func() {
+		id, err := ghosttyScript(`on run argv
+	if application "Ghostty" is running then
+		tell application "Ghostty"
+			repeat 15 times
+				set matches to every terminal whose name is (item 1 of argv)
+				if (count of matches) > 0 then
+					set targetTerminal to item 1 of matches
+					if not (perform action ("set_tab_title:" & item 2 of argv) on targetTerminal) then error "Cannot set tab title"
+					return id of targetTerminal
+				end if
+				delay 0.02
+			end repeat
+			error "Cannot find current Ghostty terminal"
+		end tell
+	end if
 end run`, marker, title)
-	if err != nil {
-		_, _ = fmt.Fprint(tty, "\x1b]2;\x1b\\")
-		tty.Close()
-		fmt.Fprintf(os.Stderr, "设置 Ghostty 标签标题失败，继续连接: %v\n", err)
-		return nil
-	}
-	_, _ = fmt.Fprintf(tty, "\x1b]2;%s\x1b\\", title)
+		mu.Lock()
+		if err == nil && id != "" && active {
+			_, _ = fmt.Fprintf(tty, "\x1b]2;%s\x1b\\", title)
+		}
+		mu.Unlock()
+		resCh <- pinResult{id: id, err: err}
+	}()
+
 	return func() {
 		defer tty.Close()
+		mu.Lock()
+		active = false
+		mu.Unlock()
+		res := <-resCh
+		if res.err != nil {
+			_, _ = fmt.Fprint(tty, "\x1b]2;\x1b\\")
+			fmt.Fprintf(os.Stderr, "设置 Ghostty 标签标题失败，继续连接: %v\n", res.err)
+			return
+		}
+		if res.id == "" {
+			_, _ = fmt.Fprint(tty, "\x1b]2;\x1b\\")
+			return
+		}
 		_, err := ghosttyScript(`on run argv
-	tell application "Ghostty"
-		if not (perform action "set_tab_title:" on terminal id (item 1 of argv)) then error "Cannot reset tab title"
-	end tell
-end run`, id)
+	if application "Ghostty" is running then
+		tell application "Ghostty"
+			if not (perform action "set_tab_title:" on terminal id (item 1 of argv)) then error "Cannot reset tab title"
+		end tell
+	end if
+end run`, res.id)
 		_, _ = fmt.Fprint(tty, "\x1b]2;\x1b\\")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "恢复 Ghostty 标签标题失败: %v\n", err)
@@ -928,10 +1148,10 @@ func connectToServer(s *ServerConfig, cfg *Config) error {
 	env = append(env, "TERM=xterm-256color")
 	if term.IsTerminal(int(os.Stderr.Fd())) {
 		name := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#38bdf8")).Render("❯ " + inventoryName(*s))
-		detail := lipgloss.NewStyle().Foreground(lipgloss.Color("#64748b")).Render(fmt.Sprintf("  [%s] %s@%s:%d", s.Group, s.User, s.Host, s.Port))
+		detail := lipgloss.NewStyle().Foreground(lipgloss.Color("#64748b")).Render(fmt.Sprintf("  [%s] %s", s.Group, formatEndpoint(s.User, s.Host, s.Port)))
 		fmt.Fprintf(os.Stderr, "\n%s\n%s\n", name, detail)
 	} else {
-		fmt.Fprintf(os.Stderr, "连接 [%s] %s (%s@%s:%d)\n", s.Group, s.Name, s.User, s.Host, s.Port)
+		fmt.Fprintf(os.Stderr, "连接 [%s] %s (%s)\n", s.Group, s.Name, formatEndpoint(s.User, s.Host, s.Port))
 	}
 	restoreTitle := pinGhosttyTabTitle(s)
 	if restoreTitle != nil {
@@ -961,10 +1181,7 @@ func inventoryName(s ServerConfig) string {
 }
 
 func inventoryGroup(s ServerConfig) string {
-	if group := strings.TrimSpace(s.Group); group != "" {
-		return group
-	}
-	return "ungrouped"
+	return cmp.Or(strings.TrimSpace(s.Group), "Default")
 }
 
 func validateInventory(cfg *Config) error {
@@ -1045,6 +1262,9 @@ func generateAnsibleINI(cfg *Config) (string, error) {
 		groups[inventoryGroup(s)] = append(groups[inventoryGroup(s)], s)
 	}
 	for _, g := range slices.Sorted(maps.Keys(groups)) {
+		if strings.IndexFunc(g, unicode.IsSpace) >= 0 {
+			return "", fmt.Errorf("Ansible INI 分组名称不能含空白字符: %q，请改用 --ansible", g)
+		}
 		fmt.Fprintf(&b, "[%s]\n", g)
 		for _, s := range groups[g] {
 			name := inventoryName(s)
@@ -1192,8 +1412,12 @@ func isKeyPath(s string) bool {
 }
 
 func parseServerArgs(args []string, defaultUser string, defaultPort int) (*ServerConfig, error) {
+	return parseServerArgsWithUsage("s -e", args, defaultUser, defaultPort)
+}
+
+func parseServerArgsWithUsage(usageCmd string, args []string, defaultUser string, defaultPort int) (*ServerConfig, error) {
 	if len(args) == 0 {
-		return nil, fmt.Errorf("缺少服务器参数。用法: s -e [user@]host [port] [password|key] [name] [group]")
+		return nil, fmt.Errorf("缺少服务器参数。用法: %s [user@]host [port] [password|key] [name] [group]", usageCmd)
 	}
 
 	s := &ServerConfig{
@@ -1213,7 +1437,7 @@ func parseServerArgs(args []string, defaultUser string, defaultPort int) (*Serve
 		target = rem
 	}
 
-	if ip := net.ParseIP(target); ip != nil {
+	if ip, err := netip.ParseAddr(target); err == nil && ip.IsValid() {
 		s.Host = target
 	} else if h, p, err := net.SplitHostPort(target); err == nil {
 		s.Host = h
@@ -1222,8 +1446,13 @@ func parseServerArgs(args []string, defaultUser string, defaultPort int) (*Serve
 			return nil, fmt.Errorf("端口必须在 1–65535 之间")
 		}
 		s.Port = port
-	} else if strings.HasPrefix(target, "[") && strings.HasSuffix(target, "]") && net.ParseIP(target[1:len(target)-1]) != nil {
-		s.Host = target[1 : len(target)-1]
+	} else if strings.HasPrefix(target, "[") && strings.HasSuffix(target, "]") {
+		inner := target[1 : len(target)-1]
+		if ip, err := netip.ParseAddr(inner); err == nil && ip.IsValid() {
+			s.Host = inner
+		} else {
+			return nil, fmt.Errorf("无效的主机或端口: %s", target)
+		}
 	} else if strings.ContainsAny(target, ":[]") {
 		return nil, fmt.Errorf("无效的主机或端口: %s", target)
 	} else {
@@ -1234,16 +1463,16 @@ func parseServerArgs(args []string, defaultUser string, defaultPort int) (*Serve
 		return nil, fmt.Errorf("未能解析出有效的主机名或 IP")
 	}
 
+	portSet := s.Port > 0
+	var nameSet, groupSet bool
 	for _, arg := range args[1:] {
-		arg = strings.TrimSpace(arg)
 		if arg == "" {
 			continue
 		}
-		if n, err := strconv.Atoi(arg); err == nil && n > 0 && n <= 65535 {
-			if s.Port == 0 {
+		if !portSet && s.Auth == "" {
+			if n, err := strconv.Atoi(arg); err == nil && n > 0 && n <= 65535 {
 				s.Port = n
-				continue
-			} else if s.Port == n {
+				portSet = true
 				continue
 			}
 		}
@@ -1257,21 +1486,28 @@ func parseServerArgs(args []string, defaultUser string, defaultPort int) (*Serve
 			}
 			continue
 		}
-		if s.Name == "" {
+		if !nameSet {
 			s.Name = arg
+			nameSet = true
 			continue
 		}
-		if s.Group == "Default" {
+		if !groupSet {
 			s.Group = arg
+			groupSet = true
 			continue
 		}
+		return nil, fmt.Errorf("参数过多: %q。用法: %s [user@]host [port] [password|key] [name] [group]", arg, usageCmd)
 	}
 
+	s.Group = cmp.Or(strings.TrimSpace(s.Group), "Default")
 	if s.Port <= 0 {
 		s.Port = cmp.Or(defaultPort, 22)
 	}
 	if s.Port < 1 || s.Port > 65535 {
 		return nil, fmt.Errorf("端口必须在 1–65535 之间")
+	}
+	if strings.ContainsRune(s.Key, 0) {
+		return nil, fmt.Errorf("服务器字段不能包含 NUL 字符")
 	}
 	for _, field := range []string{s.Host, s.User, s.Name, s.Group} {
 		if strings.IndexFunc(field, unicode.IsControl) >= 0 {
@@ -1293,19 +1529,25 @@ func parseServerArgs(args []string, defaultUser string, defaultPort int) (*Serve
 }
 
 func quickAddServer(args []string) error {
+	return quickAddServerWithUsage("s -e", args)
+}
+
+func quickAddServerWithUsage(usageCmd string, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("缺少服务器参数。用法: s -e [user@]host [port] [password|key] [name] [group]")
+		return fmt.Errorf("缺少服务器参数。用法: %s [user@]host [port] [password|key] [name] [group]", usageCmd)
 	}
 	var server *ServerConfig
-	err := editServersConfig(func(cfg *Config, servers *yaml.Node) error {
+	var defaultKey string
+	_, err := editServersConfig(func(cfg *Config, servers *yaml.Node) error {
 		var err error
-		server, err = parseServerArgs(args, cfg.Default.User, cfg.Default.Port)
+		server, err = parseServerArgsWithUsage(usageCmd, args, cfg.Default.User, cfg.Default.Port)
 		if err != nil {
 			return err
 		}
 		if err := validatePassword(server.Password); err != nil {
 			return err
 		}
+		defaultKey = cfg.Default.Key
 		var entry yaml.Node
 		if err := entry.Encode(server); err != nil {
 			return err
@@ -1318,50 +1560,64 @@ func quickAddServer(args []string) error {
 	}
 	authDesc := "密码认证"
 	if server.Auth == "key" {
-		authDesc = "密钥认证: " + server.Key
+		if key := cmp.Or(server.Key, defaultKey); key != "" {
+			authDesc = "密钥认证: " + key
+		} else {
+			authDesc = "密钥认证"
+		}
 	}
 	fmt.Println("✓ 已成功将服务器添加到配置文件")
 	fmt.Printf("  • 名称: %s\n", server.Name)
 	fmt.Printf("  • 分组: %s\n", server.Group)
-	fmt.Printf("  • 目标: %s@%s\n", server.User, net.JoinHostPort(server.Host, strconv.Itoa(server.Port)))
+	fmt.Printf("  • 目标: %s\n", formatEndpoint(server.User, server.Host, server.Port))
 	fmt.Printf("  • 认证: %s\n", authDesc)
 	return nil
 }
 
-func editServersConfig(edit func(*Config, *yaml.Node) error) error {
+func editServersConfig(edit func(*Config, *yaml.Node) error) (*Config, error) {
 	cfgPath, err := getConfigPath()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Dir(cfgPath), 0700); err != nil {
-		return err
+		return nil, err
 	}
 	lock, err := os.OpenFile(cfgPath+".lock", os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW, 0600)
 	if err != nil {
-		return fmt.Errorf("打开配置锁失败: %w", err)
+		return nil, fmt.Errorf("打开配置锁失败: %w", err)
 	}
 	defer lock.Close()
 	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
-		return fmt.Errorf("锁定配置失败: %w", err)
+		return nil, fmt.Errorf("锁定配置失败: %w", err)
 	}
 	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
-	cfg, cfgPath, err := loadConfig()
+	f, cfgPath, err := openConfig()
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	raw, err := os.ReadFile(cfgPath)
+	raw, readErr := io.ReadAll(f)
+	closeErr := f.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("读取配置文件失败: %w", readErr)
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	cfg, err := decodeConfig(raw)
 	if err != nil {
-		return fmt.Errorf("读取配置文件失败: %w", err)
+		return nil, err
 	}
 
 	var document yaml.Node
 	if err := yaml.Unmarshal(raw, &document); err != nil {
-		return fmt.Errorf("解析 YAML 配置失败: %w", err)
+		return nil, fmt.Errorf("解析 YAML 配置失败: %w", err)
+	}
+	if len(document.Content) == 0 {
+		return nil, fmt.Errorf("配置必须为 YAML 映射")
 	}
 	root := document.Content[0]
 	if root.Kind != yaml.MappingNode {
-		return fmt.Errorf("配置必须为 YAML 映射")
+		return nil, fmt.Errorf("配置必须为 YAML 映射")
 	}
 	var servers *yaml.Node
 	for i := 0; i < len(root.Content); i += 2 {
@@ -1381,45 +1637,49 @@ func editServersConfig(edit func(*Config, *yaml.Node) error) error {
 		servers.Kind, servers.Tag, servers.Value = yaml.SequenceNode, "!!seq", ""
 	}
 	if servers.Kind != yaml.SequenceNode {
-		return fmt.Errorf("servers 必须为 YAML 序列")
+		return nil, fmt.Errorf("servers 必须为 YAML 序列")
 	}
 	if err := edit(cfg, servers); err != nil {
-		return err
+		return nil, err
 	}
 	var buffer bytes.Buffer
 	encoder := yaml.NewEncoder(&buffer)
 	encoder.SetIndent(2)
 	if err := encoder.Encode(&document); err != nil {
-		return fmt.Errorf("编码 YAML 配置失败: %w", err)
+		return nil, fmt.Errorf("编码 YAML 配置失败: %w", err)
 	}
 	if err := encoder.Close(); err != nil {
-		return err
+		return nil, err
 	}
 	updated := buffer.Bytes()
+	updatedCfg, err := decodeConfig(updated)
+	if err != nil {
+		return nil, err
+	}
 
 	dir := filepath.Dir(cfgPath)
 	temp, err := os.CreateTemp(dir, "sshtui-servers-*.yaml")
 	if err != nil {
-		return fmt.Errorf("创建临时文件失败: %w", err)
+		return nil, fmt.Errorf("创建临时文件失败: %w", err)
 	}
 	defer os.Remove(temp.Name())
 
 	if _, err := temp.Write(updated); err != nil {
 		temp.Close()
-		return fmt.Errorf("写入临时文件失败: %w", err)
+		return nil, fmt.Errorf("写入临时文件失败: %w", err)
 	}
 	if err := temp.Chmod(0600); err != nil {
 		temp.Close()
-		return fmt.Errorf("设置文件权限失败: %w", err)
+		return nil, fmt.Errorf("设置文件权限失败: %w", err)
 	}
 	if err := temp.Close(); err != nil {
-		return err
+		return nil, err
 	}
 	if err := os.Rename(temp.Name(), cfgPath); err != nil {
-		return fmt.Errorf("保存配置文件失败: %w", err)
+		return nil, fmt.Errorf("保存配置文件失败: %w", err)
 	}
 
-	return nil
+	return updatedCfg, nil
 }
 
 func directMatch(servers []ServerConfig, term string) *ServerConfig {
@@ -1468,11 +1728,21 @@ func run() error {
 		return runAnsibleCommand(*group, strings.Join(runCmd.Args(), " "))
 	}
 	if len(os.Args) > 1 && os.Args[1] == "add" {
-		return quickAddServer(os.Args[2:])
+		addCmd := flag.NewFlagSet("add", flag.ContinueOnError)
+		addCmd.Usage = func() {
+			fmt.Fprintf(addCmd.Output(), "用法: s add [user@]host [port] [password|key] [name] [group]\n")
+		}
+		if err := addCmd.Parse(os.Args[2:]); err != nil {
+			if err == flag.ErrHelp {
+				return nil
+			}
+			return err
+		}
+		return quickAddServerWithUsage("s add", addCmd.Args())
 	}
 
-	edit := flag.Bool("e", false, "打开配置文件编辑，或带参数快速添加服务器: s -e [user@]host [port] [password|key]")
-	add := flag.Bool("a", false, "快速添加服务器到配置文件: s -a [user@]host [port] [password|key]")
+	edit := flag.Bool("e", false, "打开配置文件编辑，或带参数快速添加服务器: s -e [user@]host [port] [password|key] [name] [group]")
+	add := flag.Bool("a", false, "快速添加服务器到配置文件: s -a [user@]host [port] [password|key] [name] [group]")
 	var showVersion bool
 	flag.BoolVar(&showVersion, "version", false, "显示版本号")
 	flag.BoolVar(&showVersion, "v", false, "显示版本号")
@@ -1482,6 +1752,14 @@ func run() error {
 	ini := flag.Bool("ansible-ini", false, "输出 Ansible INI 格式")
 	ansibleList := flag.Bool("list", false, "Ansible 官方动态清单规范 Hook (等同于 --ansible)")
 	ansibleHost := flag.String("host", "", "Ansible 官方单机查询 Hook")
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		cmdName := filepath.Base(os.Args[0])
+		fmt.Fprintf(out, "用法: %s [选项] [筛选词]\n", cmdName)
+		fmt.Fprintf(out, "      %s add [user@]host [port] [password|key] [name] [group]\n", cmdName)
+		fmt.Fprintf(out, "      %s run [-g 分组] \"要执行的命令\"\n\n选项:\n", cmdName)
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
 	if showVersion {
@@ -1497,12 +1775,12 @@ func run() error {
 	}
 	if *edit {
 		if flag.NArg() > 0 {
-			return quickAddServer(flag.Args())
+			return quickAddServerWithUsage("s -e", flag.Args())
 		}
 		return editConfig()
 	}
 	if *add {
-		return quickAddServer(flag.Args())
+		return quickAddServerWithUsage("s -a", flag.Args())
 	}
 	cfg, cfgPath, err := loadConfig()
 	if err != nil {
@@ -1541,7 +1819,7 @@ func run() error {
 			if s.Auth == "password" {
 				auth = "🔒 密码"
 			}
-			fmt.Printf("%2d. [%s] %-20s %s@%s:%d (%s)\n", i+1, s.Group, s.Name, s.User, s.Host, s.Port, auth)
+			fmt.Printf("%2d. [%s] %-20s %s (%s)\n", i+1, s.Group, s.Name, formatEndpoint(s.User, s.Host, s.Port), auth)
 			i++
 		}
 		return nil

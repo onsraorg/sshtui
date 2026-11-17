@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestQuickAddYAMLLayouts(t *testing.T) {
@@ -96,5 +98,55 @@ func TestQuickAddConcurrentProcesses(t *testing.T) {
 		if directMatch(cfg.Servers, fmt.Sprintf("192.0.2.%d", i+1)) == nil {
 			t.Fatalf("concurrent addition %d lost", i+1)
 		}
+	}
+}
+
+func TestQuickAddCLIUsageAndKeyDisplay(t *testing.T) {
+	home, path := configFixture(t, "servers: []\n")
+	if out, err := cliCommand(t, map[string]string{"HOME": home}, "add", "--help").CombinedOutput(); err != nil || !strings.Contains(string(out), "用法: s add") {
+		t.Fatalf("s add --help failed: %v %s", err, out)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "servers: []\n" {
+		t.Fatalf("s add --help modified config: %q (%v)", data, err)
+	}
+	if out, err := cliCommand(t, map[string]string{"HOME": home}, "add", "--", "192.0.2.9", "22", "-secret").CombinedOutput(); err != nil {
+		t.Fatalf("s add -- failed: %v %s", err, out)
+	}
+	t.Setenv("HOME", home)
+	cfg, _, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if added := directMatch(cfg.Servers, "192.0.2.9"); added == nil || added.Password != "-secret" {
+		t.Fatalf("s add -- saved wrong entry: %+v", cfg.Servers)
+	}
+	if out, err := cliCommand(t, map[string]string{"HOME": home}, "-a").CombinedOutput(); err == nil || !strings.Contains(string(out), "用法: s -a") {
+		t.Fatalf("s -a usage mismatch: %v %s", err, out)
+	}
+	if out, err := cliCommand(t, map[string]string{"HOME": home}, "-e", "192.0.2.1", "22", "pass", "n", "Default", "extra").CombinedOutput(); err == nil || !strings.Contains(string(out), "参数过多") {
+		t.Fatalf("s -e accepted excess args: %v %s", err, out)
+	}
+	if out, err := cliCommand(t, map[string]string{"HOME": home}, "-h").CombinedOutput(); err != nil || !strings.Contains(string(out), "add") || !strings.Contains(string(out), "run") || !strings.Contains(string(out), "[name] [group]") {
+		t.Fatalf("s -h missing usage details: %v %s", err, out)
+	}
+
+	// Key auth display uses default.key when present and avoids dangling ": " when empty.
+	out, err := cliCommand(t, map[string]string{"HOME": home}, "-e", "192.0.2.10").CombinedOutput()
+	if err != nil || strings.Contains(string(out), "密钥认证:") {
+		t.Fatalf("unexpected key description without default.key: %v %s", err, out)
+	}
+	homeDefaultKey, _ := configFixture(t, "default: {key: ~/.ssh/id_ed25519}\nservers: []\n")
+	out, err = cliCommand(t, map[string]string{"HOME": homeDefaultKey}, "-e", "192.0.2.11").CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "密钥认证: ~/.ssh/id_ed25519") {
+		t.Fatalf("default.key not shown: %v %s", err, out)
+	}
+
+	t.Setenv("HOME", home)
+	if err := os.WriteFile(path, []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := editServersConfig(func(*Config, *yaml.Node) error { return nil }); err == nil {
+		t.Fatal("empty config should return error, not succeed or panic")
 	}
 }

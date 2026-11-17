@@ -59,5 +59,14 @@ func getProcessPPID(pid int) (int, error) {
 }
 
 func getProcessPath(pid int) (string, error) {
-	return os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	path, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	if err != nil {
+		return "", err
+	}
+	if strings.HasSuffix(path, " (deleted)") {
+		if _, statErr := os.Lstat(path); os.IsNotExist(statErr) {
+			return strings.TrimSuffix(path, " (deleted)"), nil
+		}
+	}
+	return path, nil
 }

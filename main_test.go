@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -37,6 +38,9 @@ func TestMain(m *testing.M) {
 				if os.Getenv("SSHTUI_TEST_TITLE_FAIL") == "1" {
 					os.Exit(1)
 				}
+				if os.Getenv("SSHTUI_TEST_GHOSTTY_NOT_RUNNING") == "1" {
+					os.Exit(0)
+				}
 				fmt.Print("test-terminal-id")
 			} else {
 				writeTestRecord(".title-reset", os.Args[4:])
@@ -54,6 +58,22 @@ func TestMain(m *testing.M) {
 				time.Sleep(10 * time.Second)
 				os.Exit(255)
 			}
+			if os.Getenv("SSHTUI_TEST_TTY_BG") == "1" {
+				writeTestRecord(".tty", [3]bool{
+					term.IsTerminal(int(os.Stdin.Fd())),
+					term.IsTerminal(int(os.Stdout.Fd())),
+					term.IsTerminal(int(os.Stderr.Fd())),
+				})
+				bg := exec.Command("/bin/sh", "-c", "sleep 3")
+				bg.Stdout = os.Stdout
+				bg.Stderr = os.Stderr
+				if err := bg.Start(); err != nil {
+					panic(err)
+				}
+				writeTestRecord(".bgpid", bg.Process.Pid)
+				time.Sleep(120 * time.Millisecond)
+				os.Exit(17)
+			}
 			for _, value := range append(os.Environ(), os.Args...) {
 				if strings.Contains(value, "audit-private-marker") {
 					panic("password leaked into subprocess arguments or environment")
@@ -70,17 +90,20 @@ func TestMain(m *testing.M) {
 			writeTestRecord(".args", os.Args[1:])
 			writeTestRecord(".term", os.Getenv("TERM"))
 			if mode := os.Getenv("SSHTUI_TEST_SESSION"); mode != "" {
-				time.Sleep(300 * time.Millisecond)
-				if _, err := term.MakeRaw(int(os.Stdin.Fd())); err != nil {
-					panic(err)
-				}
 				if strings.HasPrefix(mode, "dirty") {
+					if _, err := term.MakeRaw(int(os.Stdin.Fd())); err != nil {
+						panic(err)
+					}
 					fmt.Print("\x1b[>7u\x1b[>7u")
 					if mode == "dirty" {
 						fmt.Print("\x1b[?1049h\x1b[>7u\x1b[>7u")
 					}
 					fmt.Print("\x1b[?1000h\x1b[?1006h\x1b[?2004h")
 					os.Exit(0)
+				}
+				time.Sleep(300 * time.Millisecond)
+				if _, err := term.MakeRaw(int(os.Stdin.Fd())); err != nil {
+					panic(err)
 				}
 				reader := bufio.NewReader(os.Stdin)
 				if mode == "password" {
@@ -163,9 +186,14 @@ func testEnv(overrides map[string]string) []string {
 	var env []string
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
-		if _, replaced := overrides[key]; !replaced && key != "TERM_PROGRAM" {
-			env = append(env, entry)
+		if _, replaced := overrides[key]; replaced {
+			continue
 		}
+		switch key {
+		case "TERM_PROGRAM", "SSH_ASKPASS_PROMPT", "SSHTUI_ASKPASS_HELPER", "SSHTUI_ASKPASS_SOCKET":
+			continue
+		}
+		env = append(env, entry)
 	}
 	for key, value := range overrides {
 		env = append(env, key+"="+value)
@@ -258,6 +286,7 @@ func TestDefaultConfigCreationIsConcurrentSafe(t *testing.T) {
 }
 
 func TestVersionWorksWithoutValidConfig(t *testing.T) {
+	t.Parallel()
 	home, _ := configFixture(t, "servers: [broken\n")
 	for _, arg := range []string{"--version", "-v"} {
 		out, err := cliCommand(t, map[string]string{"HOME": home}, arg).CombinedOutput()
@@ -273,8 +302,8 @@ func TestConfigRejectsUnusableCredentials(t *testing.T) {
 			data, _ := yaml.Marshal(Config{Servers: []ServerConfig{{Name: "node", Host: "192.0.2.1", Auth: "password", Password: password}}})
 			home, _ := configFixture(t, string(data))
 			t.Setenv("HOME", home)
-			if _, _, err := loadConfig(); err == nil {
-				t.Fatal("invalid credential was accepted")
+			if _, _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "密码") {
+				t.Fatalf("invalid credential was accepted or rejected for wrong reason: %v", err)
 			}
 		})
 	}
@@ -289,14 +318,79 @@ func TestConfigRejectsUnknownAndControlFields(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			home, _ := configFixture(t, contents)
 			t.Setenv("HOME", home)
-			if _, _, err := loadConfig(); err == nil {
-				t.Fatal("unsafe config was accepted")
+			if _, _, err := loadConfig(); err == nil || strings.Contains(err.Error(), "port") {
+				t.Fatalf("unsafe config was accepted or rejected for wrong reason: %v", err)
 			}
 		})
 	}
 }
 
+func TestConfigPortZeroDefaultValidationAndGroupNormalization(t *testing.T) {
+	for name, tc := range map[string]struct {
+		raw     string
+		wantErr string
+	}{
+		"server-port-zero":           {"servers:\n  - {name: node, host: 192.0.2.1, port: 0}\n", "1–65535"},
+		"server-port-hex-zero":       {"servers:\n  - {name: node, host: 192.0.2.1, port: 0x0}\n", "1–65535"},
+		"server-merge-zero":          {"servers:\n  - &base {name: base, host: 192.0.2.1, port: 0}\n  - {<<: *base, name: child}\n", "1–65535"},
+		"server-merge-override-zero": {"servers:\n  - &base {name: base, host: 192.0.2.1, port: 2222}\n  - {<<: *base, name: child, port: 0}\n", "1–65535"},
+		"default-port-zero":          {"default: {port: 0}\nservers: []\n", "default.port"},
+		"default-port-too-high":      {"default: {port: 70000}\nservers: []\n", "default.port"},
+		"default-port-negative":      {"default: {port: -1}\nservers: []\n", "default.port"},
+		"default-user-control":       {"default: {user: \"root\\e\"}\nservers: []\n", "default.user"},
+		"default-key-nul":            {"default: {key: \"k\\0\"}\nservers: []\n", "NUL"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := decodeConfig([]byte(tc.raw)); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("config %q: got err=%v, want %q", name, err, tc.wantErr)
+			}
+		})
+	}
+
+	cfg, err := decodeConfig([]byte("default: {port: 2222}\nservers:\n  - {name: node, host: 192.0.2.1, group: \"   \"}\n"))
+	if err != nil {
+		t.Fatalf("valid omitted port failed: %v", err)
+	}
+	if cfg.Servers[0].Port != 2222 || cfg.Servers[0].Group != "Default" || inventoryGroup(cfg.Servers[0]) != "Default" {
+		t.Fatalf("unexpected normalization: %+v", cfg.Servers[0])
+	}
+	if got := inventoryGroup(ServerConfig{Group: "   "}); got != "Default" {
+		t.Fatalf("inventoryGroup blank = %q, want Default", got)
+	}
+	jsonOut, err := generateAnsibleJSON(cfg)
+	if err != nil || !strings.Contains(string(jsonOut), `"Default"`) || strings.Contains(string(jsonOut), "ungrouped") {
+		t.Fatalf("JSON group mismatch: %s (%v)", jsonOut, err)
+	}
+}
+
+func TestIPv6EndpointFormattingAcrossViewsAndCLI(t *testing.T) {
+	cfg := &Config{Servers: []ServerConfig{{Name: "v6", Group: "Default", Host: "2001:db8::1", User: "u", Port: 2222, Auth: "key"}}}
+	for _, size := range []tea.WindowSizeMsg{{Width: 80, Height: 24}, {Width: 40, Height: 10}} {
+		next, _ := initialModel(cfg, "").Update(size)
+		view := next.(model).View()
+		if !strings.Contains(view, "u@[2001:db8::1]:2222") {
+			t.Fatalf("view %+v missing bracketed IPv6 endpoint: %q", size, view)
+		}
+	}
+
+	home, _ := configFixture(t, "servers:\n  - {name: v6, host: 2001:db8::1, user: u, port: 2222}\n")
+	listOut, err := cliCommand(t, map[string]string{"HOME": home}, "-l").CombinedOutput()
+	if err != nil || !strings.Contains(string(listOut), "u@[2001:db8::1]:2222") {
+		t.Fatalf("-l missing bracketed IPv6 endpoint: %v %q", err, listOut)
+	}
+
+	bin := t.TempDir()
+	binary, _ := os.Executable()
+	linkHelper(t, bin, "ssh", binary)
+	log := filepath.Join(t.TempDir(), "log")
+	connOut, err := cliCommand(t, map[string]string{"HOME": home, "PATH": bin, "SSHTUI_TEST_LOG": log}, "v6").CombinedOutput()
+	if err == nil || !strings.Contains(string(connOut), "(u@[2001:db8::1]:2222)") {
+		t.Fatalf("connectToServer missing bracketed IPv6 endpoint: %v %q", err, connOut)
+	}
+}
+
 func TestEditorAndPathWorkWithBrokenYAML(t *testing.T) {
+	t.Parallel()
 	home, path := configFixture(t, "servers: [broken\n")
 	bin := t.TempDir()
 	editor := filepath.Join(bin, "editor with spaces")
@@ -375,6 +469,16 @@ func TestInventoryRejectsCollisions(t *testing.T) {
 		if _, err := generateAnsibleINI(cfg); err == nil {
 			t.Fatal("INI accepted an ambiguous inventory")
 		}
+	}
+}
+
+func TestInventoryINIRejectsGroupWhitespace(t *testing.T) {
+	cfg := &Config{Servers: []ServerConfig{{Name: "node", Group: "my group", Host: "192.0.2.1"}}}
+	if _, err := generateAnsibleJSON(cfg); err != nil {
+		t.Fatalf("JSON should accept spaced group name: %v", err)
+	}
+	if _, err := generateAnsibleINI(cfg); err == nil || !strings.Contains(err.Error(), "--ansible") {
+		t.Fatalf("INI should reject spaced group name: %v", err)
 	}
 }
 
@@ -469,6 +573,7 @@ func TestSSHOptionsRespectOverrides(t *testing.T) {
 }
 
 func TestSSHHandshakeTimeout(t *testing.T) {
+	t.Parallel()
 	ssh, err := exec.LookPath("ssh")
 	if err != nil {
 		t.Skip("ssh is not installed")
@@ -639,6 +744,91 @@ func TestPickerColumnNavigationAndResize(t *testing.T) {
 	}
 }
 
+func TestPickerFilterDisplaySpaceAndViewportClamping(t *testing.T) {
+	cfg := &Config{}
+	for i := range 30 {
+		cfg.Servers = append(cfg.Servers, ServerConfig{Name: fmt.Sprintf("node-%02d", i), Host: "192.0.2.1", User: "root", Port: 22})
+	}
+	cfg.Servers = append(cfg.Servers, ServerConfig{Name: "prod db", Host: "192.0.2.99", User: "root", Port: 22})
+
+	for _, size := range []tea.WindowSizeMsg{{Width: 80, Height: 24}, {Width: 40, Height: 10}} {
+		next, _ := initialModel(cfg, "").Update(size)
+		m := next.(model)
+		if strings.Contains(m.View(), "Filter: …") || strings.Contains(m.View(), "❯ …") {
+			t.Fatalf("empty filter rendered ellipsis at %+v: %q", size, m.View())
+		}
+		for _, r := range "prod" {
+			next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+			m = next.(model)
+		}
+		next, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}})
+		m = next.(model)
+		for _, r := range "db" {
+			next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+			m = next.(model)
+		}
+		view := m.View()
+		if m.filter != "prod db" || !strings.Contains(view, "prod db") || len(m.filtered) != 1 {
+			t.Fatalf("space filter failed at %+v: filter=%q filtered=%d view=%q", size, m.filter, len(m.filtered), view)
+		}
+	}
+
+	// Long and control-laden filters must keep trailing text and stay within terminal bounds.
+	longFilter := strings.Repeat("a", 1500) + "TAIL"
+	next, _ := initialModel(cfg, "prod\ndb\x1b[31m").Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m := next.(model)
+	if m.filter != "prod db[31m" || lipgloss.Height(m.View()) > 24 {
+		t.Fatalf("control filter not sanitized: filter=%q height=%d", m.filter, lipgloss.Height(m.View()))
+	}
+	m.filter = longFilter
+	m.applyFilter()
+	view := m.View()
+	if !strings.Contains(view, "…") || !strings.Contains(view, "TAIL") || lipgloss.Width(view) > 80 || lipgloss.Height(view) > 24 {
+		t.Fatalf("long filter overflowed or lost tail: %dx%d", lipgloss.Width(view), lipgloss.Height(view))
+	}
+	for _, tc := range []struct {
+		in   string
+		w    int
+		want string
+	}{
+		{"", 56, ""},
+		{"prod", 56, "prod"},
+		{"中文测试", 5, "…测试"},
+		{"a👨‍👩‍👧b", 3, "…b"},
+		{"abc", 1, "…"},
+		{"abc", 0, ""},
+	} {
+		if got := truncateLeft(tc.in, tc.w); got != tc.want {
+			t.Fatalf("truncateLeft(%q, %d) = %q, want %q", tc.in, tc.w, got, tc.want)
+		}
+	}
+
+	// Viewport top must clamp when filtered results shrink or terminal height grows.
+	next, _ = initialModel(cfg, "").Update(tea.WindowSizeMsg{Width: 40, Height: 10})
+	m = next.(model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = next.(model)
+	for _, r := range "node-1" {
+		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = next.(model)
+	}
+	if m.viewportTop != 3 || !strings.Contains(m.View(), "node-13") || !strings.Contains(m.View(), "node-19") {
+		t.Fatalf("shrunk filter did not fill viewport: top=%d view=%q", m.viewportTop, m.View())
+	}
+
+	next, _ = initialModel(cfg, "").Update(tea.WindowSizeMsg{Width: 40, Height: 10})
+	m = next.(model)
+	for range 23 {
+		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m = next.(model)
+	}
+	next, _ = m.Update(tea.WindowSizeMsg{Width: 40, Height: 24})
+	m = next.(model)
+	if m.viewportTop != 10 || !strings.Contains(m.View(), "node-10") {
+		t.Fatalf("resized taller viewport left blank rows: top=%d view=%q", m.viewportTop, m.View())
+	}
+}
+
 func TestSSHInvocation(t *testing.T) {
 	for _, backend := range []string{"key", "askpass"} {
 		t.Run(backend, func(t *testing.T) {
@@ -672,6 +862,7 @@ func TestSSHInvocation(t *testing.T) {
 }
 
 func TestConnectionProgressFailureAndCancel(t *testing.T) {
+	t.Parallel()
 	expect, err := exec.LookPath("expect")
 	if err != nil {
 		t.Skip("expect is not installed")
@@ -710,14 +901,65 @@ exit [lindex $result 3]
 			if ctx.Err() != nil || err == nil || err.(*exec.ExitError).ExitCode() != wantExit {
 				t.Fatalf("connection %s: %v; output: %s", mode, err, out)
 			}
-			if !strings.Contains(string(out), "\x1b[1A\r\x1b[2K") {
+			if !strings.Contains(string(out), "\r\x1b[2K") {
 				t.Fatalf("connection animation was not cleared: %q", out)
 			}
 		})
 	}
 }
 
+func TestRunSSHPreservesTTYAndDoesNotWaitOnBackgroundChild(t *testing.T) {
+	t.Parallel()
+	expect, err := exec.LookPath("expect")
+	if err != nil {
+		t.Skip("expect is not installed")
+	}
+	home, _ := configFixture(t, "servers:\n  - {name: node, host: 192.0.2.1, auth: key}\n")
+	bin := t.TempDir()
+	binary, _ := os.Executable()
+	linkHelper(t, bin, "ssh", binary)
+	log := filepath.Join(t.TempDir(), "log")
+	t.Cleanup(func() {
+		if data, err := os.ReadFile(log + ".bgpid"); err == nil {
+			var pid int
+			if json.Unmarshal(data, &pid) == nil && pid > 0 {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	driver := `
+set timeout 2
+spawn -noecho /bin/sh -c {"$SSHTUI_TEST_BINARY" node; echo "DONE:$?"}
+expect {
+    "DONE:17" {}
+    timeout { puts stderr "runSSH stalled waiting on backgrounded child"; exit 101 }
+    eof { exit 102 }
+}
+`
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, expect, "-c", driver)
+	cmd.Env = testEnv(map[string]string{
+		"HOME": home, "PATH": bin + string(os.PathListSeparator) + os.Getenv("PATH"), "TERM": "xterm-256color",
+		"SSHTUI_TEST_PROCESS": "1", "SSHTUI_TEST_BINARY": binary,
+		"SSHTUI_TEST_LOG": log, "SSHTUI_TEST_TTY_BG": "1",
+	})
+	start := time.Now()
+	out, err := cmd.CombinedOutput()
+	elapsed := time.Since(start)
+	if ctx.Err() != nil || err != nil {
+		t.Fatalf("TTY/background child check failed: %v (%v); output: %q", err, ctx.Err(), out)
+	}
+	if elapsed >= 1500*time.Millisecond {
+		t.Fatalf("runSSH blocked waiting on backgrounded child: took %s", elapsed)
+	}
+	if tty := readRecord[[3]bool](t, log+".tty"); tty != [3]bool{true, true, true} {
+		t.Fatalf("child stdio TTY flags = %v, want [true true true]", tty)
+	}
+}
+
 func TestSSHRestoresTerminalAfterDirtyChild(t *testing.T) {
+	t.Parallel()
 	expect, err := exec.LookPath("expect")
 	if err != nil {
 		t.Skip("expect is not installed")
@@ -800,6 +1042,7 @@ exit [lindex $result 3]
 }
 
 func TestPasswordHelperInteractiveSession(t *testing.T) {
+	t.Parallel()
 	expect, err := exec.LookPath("expect")
 	if err != nil {
 		t.Skip("expect is not installed")
@@ -952,6 +1195,57 @@ exit [lindex $result 3]
 	}
 }
 
+func TestGhosttyNotRunningIsSilentNoOp(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS != "darwin" {
+		t.Skip("Ghostty tab integration is macOS-only")
+	}
+	expect, err := exec.LookPath("expect")
+	if err != nil {
+		t.Skip("expect is not installed")
+	}
+	home, _ := configFixture(t, "servers:\n  - {name: node, host: 192.0.2.1, auth: key}\n")
+	bin := t.TempDir()
+	binary, _ := os.Executable()
+	linkHelper(t, bin, "ssh", binary)
+	linkHelper(t, bin, "osascript", binary)
+	log := filepath.Join(t.TempDir(), "log")
+	driver := `
+set timeout 4
+spawn -noecho $env(SSHTUI_TEST_BINARY) node
+expect {
+    eof {}
+    timeout { puts stderr "SSH did not exit"; exit 101 }
+}
+set result [wait]
+exit [lindex $result 3]
+`
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, expect, "-c", driver)
+	cmd.Env = testEnv(map[string]string{
+		"HOME": home, "PATH": bin, "TERM": "xterm-256color", "TERM_PROGRAM": "ghostty", "TMUX": "",
+		"SSHTUI_TEST_PROCESS": "1", "SSHTUI_TEST_BINARY": binary, "SSHTUI_TEST_LOG": log,
+		"SSHTUI_TEST_GHOSTTY_NOT_RUNNING": "1",
+	})
+	out, err := cmd.CombinedOutput()
+	if err == nil || err.(*exec.ExitError).ExitCode() != 17 {
+		t.Fatalf("expected SSH exit 17, got %v; output: %q", err, out)
+	}
+	if set := readRecord[[]string](t, log+".title-set"); len(set) != 2 || set[1] != "node" {
+		t.Fatalf("unexpected title-set args: %q", set)
+	}
+	if _, err := os.Stat(log + ".title-reset"); !os.IsNotExist(err) {
+		t.Fatal("restore script ran when Ghostty was not running")
+	}
+	if !strings.Contains(string(out), "\x1b]2;\x1b\\") {
+		t.Fatalf("OSC title marker was not cleared: %q", out)
+	}
+	if strings.Contains(string(out), "设置 Ghostty 标签标题失败") || strings.Contains(string(out), "恢复 Ghostty 标签标题失败") {
+		t.Fatalf("unexpected Ghostty error output when not running: %q", out)
+	}
+}
+
 func TestAskpassRejectsNonPasswordPrompts(t *testing.T) {
 	for _, prompt := range []string{"Enter passphrase for key '/tmp/key':", "Are you sure you want to continue connecting?"} {
 		out, err := cliCommand(t, map[string]string{"SSHTUI_ASKPASS_HELPER": "1"}, prompt).CombinedOutput()
@@ -1037,6 +1331,58 @@ func TestParseServerArgs(t *testing.T) {
 			wantPass: "MyPassword123",
 			wantName: "[2001:db8::1]:2222",
 		},
+		{
+			args:     []string{"192.0.2.1", "22", " pass with spaces "},
+			wantUser: "root",
+			wantHost: "192.0.2.1",
+			wantPort: 22,
+			wantAuth: "password",
+			wantPass: " pass with spaces ",
+			wantName: "192.0.2.1",
+		},
+		{
+			args:     []string{"fe80::1%eth0"},
+			wantUser: "root",
+			wantHost: "fe80::1%eth0",
+			wantPort: 22,
+			wantAuth: "key",
+			wantName: "fe80::1%eth0",
+		},
+		{
+			args:     []string{"[fe80::1%eth0]"},
+			wantUser: "root",
+			wantHost: "fe80::1%eth0",
+			wantPort: 22,
+			wantAuth: "key",
+			wantName: "fe80::1%eth0",
+		},
+		{
+			args:     []string{"192.0.2.1", "22", "22"},
+			wantUser: "root",
+			wantHost: "192.0.2.1",
+			wantPort: 22,
+			wantAuth: "password",
+			wantPass: "22",
+			wantName: "192.0.2.1",
+		},
+		{
+			args:     []string{"192.0.2.1:2222", "2222"},
+			wantUser: "root",
+			wantHost: "192.0.2.1",
+			wantPort: 2222,
+			wantAuth: "password",
+			wantPass: "2222",
+			wantName: "192.0.2.1:2222",
+		},
+		{
+			args:     []string{"192.0.2.1", "22", "pass", "22"},
+			wantUser: "root",
+			wantHost: "192.0.2.1",
+			wantPort: 22,
+			wantAuth: "password",
+			wantPass: "pass",
+			wantName: "22",
+		},
 	}
 
 	for _, tc := range cases {
@@ -1047,6 +1393,15 @@ func TestParseServerArgs(t *testing.T) {
 		if s.User != tc.wantUser || s.Host != tc.wantHost || s.Port != tc.wantPort || s.Auth != tc.wantAuth || s.Password != tc.wantPass || s.Key != tc.wantKey || s.Name != tc.wantName {
 			t.Fatalf("parseServerArgs(%v) = %+v, want %+v", tc.args, s, tc)
 		}
+	}
+	if _, err := parseServerArgs([]string{"192.0.2.1", "/tmp/k\x00ey"}, "root", 22); err == nil {
+		t.Fatal("NUL byte in key path was accepted")
+	}
+	if _, err := parseServerArgs([]string{"192.0.2.1", "22", "pass", "name", "Default", "extra"}, "root", 22); err == nil || !strings.Contains(err.Error(), "参数过多") {
+		t.Fatalf("extra arg after explicit Default group was accepted: %v", err)
+	}
+	if s, err := parseServerArgs([]string{"192.0.2.1", "22", "pass", "name", "   "}, "root", 22); err != nil || s.Group != "Default" {
+		t.Fatalf("blank group did not normalize to Default: %+v (%v)", s, err)
 	}
 }
 

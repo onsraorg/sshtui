@@ -129,6 +129,30 @@ func TestInstallSpaceSafe(t *testing.T) {
 	if !strings.Contains(string(runOut), "sshtui executed") {
 		t.Errorf("unexpected output from installed binary: %s", string(runOut))
 	}
+
+	// 验证相对路径 INSTALL_DIR 也能生成有效的绝对目标软链
+	relDir := filepath.Join("rel space dir", "bin")
+	relCmd := exec.Command("make", "-f", makefilePath, "install", "-o", "build", "INSTALL_DIR="+relDir)
+	relCmd.Dir = tempDir
+	if out, err := relCmd.CombinedOutput(); err != nil {
+		t.Fatalf("make install with relative INSTALL_DIR failed: %v, output: %s", err, string(out))
+	}
+	relSymlink := filepath.Join(tempDir, relDir, "s")
+	relLinkDest, err := os.Readlink(relSymlink)
+	if err != nil {
+		t.Fatalf("expected relative install symlink s to be readable: %v", err)
+	}
+	wantRelTarget := filepath.Join(tempDir, relDir, "sshtui")
+	if relLinkDest != wantRelTarget {
+		t.Errorf("expected relative install symlink target %s, got %s", wantRelTarget, relLinkDest)
+	}
+	relRunOut, err := exec.Command(relSymlink).CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to run relative-installed symlink: %v, output: %s", err, string(relRunOut))
+	}
+	if !strings.Contains(string(relRunOut), "sshtui executed") {
+		t.Errorf("unexpected output from relative-installed binary: %s", string(relRunOut))
+	}
 }
 
 // TestReadVersionScript 测试 scripts/read-version.sh 的严格 X.Y.Z 语义版本解析
@@ -180,8 +204,9 @@ func TestReadVersionScript(t *testing.T) {
 }
 
 // TestGitReleaseWorkflowLocal 测试本地 scratch git 仓库与 bare remote 交互（不联网）
-// 覆盖: detached HEAD、非默认分支、push 失败远端有/无/未知、以及 tag 清理与保留逻辑
+// 覆盖: detached HEAD、非默认分支、CHANGELOG 校验、push 失败远端有/无/未知、以及 tag 清理与保留逻辑
 func TestGitReleaseWorkflowLocal(t *testing.T) {
+	t.Parallel()
 	releaseCheckScript, err := filepath.Abs("scripts/release-check.sh")
 	if err != nil {
 		t.Fatalf("resolve release-check failed: %v", err)
@@ -193,6 +218,10 @@ func TestGitReleaseWorkflowLocal(t *testing.T) {
 	readVerScript, err := filepath.Abs("scripts/read-version.sh")
 	if err != nil {
 		t.Fatalf("resolve read-version failed: %v", err)
+	}
+	extractChangelogScript, err := filepath.Abs("scripts/extract-changelog.sh")
+	if err != nil {
+		t.Fatalf("resolve extract-changelog failed: %v", err)
 	}
 
 	// 辅助运行 git 命令
@@ -235,6 +264,7 @@ func TestGitReleaseWorkflowLocal(t *testing.T) {
 			{releaseCheckScript, filepath.Join(scriptsDir, "release-check.sh")},
 			{pushReleaseScript, filepath.Join(scriptsDir, "push-release.sh")},
 			{readVerScript, filepath.Join(scriptsDir, "read-version.sh")},
+			{extractChangelogScript, filepath.Join(scriptsDir, "extract-changelog.sh")},
 		} {
 			data, err := os.ReadFile(s.src)
 			if err != nil {
@@ -247,6 +277,9 @@ func TestGitReleaseWorkflowLocal(t *testing.T) {
 
 		if err := os.WriteFile(filepath.Join(workDir, "VERSION"), []byte("0.2.0\n"), 0644); err != nil {
 			t.Fatalf("write VERSION failed: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(workDir, "CHANGELOG.md"), []byte("# 更新记录\n\n## 0.2.0 — 2026-11-03\n\n- test release\n"), 0644); err != nil {
+			t.Fatalf("write CHANGELOG.md failed: %v", err)
 		}
 		runGit(t, workDir, "add", ".")
 		runGit(t, workDir, "commit", "-m", "init commit")
@@ -292,6 +325,38 @@ func TestGitReleaseWorkflowLocal(t *testing.T) {
 			t.Fatalf("expected release-check to fail on detached HEAD, but passed: %s", string(out))
 		}
 		if !strings.Contains(string(out), "游离 HEAD") {
+			t.Errorf("unexpected error output: %s", string(out))
+		}
+	})
+
+	t.Run("ReleaseCheck_FailsWhenChangelogMissingSection", func(t *testing.T) {
+		_, workDir := setupRepos(t)
+		if err := os.WriteFile(filepath.Join(workDir, "CHANGELOG.md"), []byte("# 更新记录\n\n## 0.1.0 — 2026-10-18\n\n- old\n"), 0644); err != nil {
+			t.Fatalf("write CHANGELOG.md failed: %v", err)
+		}
+		cmd := exec.Command("./scripts/release-check.sh")
+		cmd.Dir = workDir
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatalf("expected release-check to fail when CHANGELOG lacks VERSION section, but passed: %s", string(out))
+		}
+		if !strings.Contains(string(out), "未找到") {
+			t.Errorf("unexpected error output: %s", string(out))
+		}
+	})
+
+	t.Run("ReleaseCheck_FailsWhenChangelogEmptySection", func(t *testing.T) {
+		_, workDir := setupRepos(t)
+		if err := os.WriteFile(filepath.Join(workDir, "CHANGELOG.md"), []byte("# 更新记录\n\n## 0.2.0 — 2026-11-03\n\n## 0.1.0 — 2026-10-18\n\n- old\n"), 0644); err != nil {
+			t.Fatalf("write CHANGELOG.md failed: %v", err)
+		}
+		cmd := exec.Command("./scripts/release-check.sh")
+		cmd.Dir = workDir
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatalf("expected release-check to fail when CHANGELOG section is empty, but passed: %s", string(out))
+		}
+		if !strings.Contains(string(out), "为空") {
 			t.Errorf("unexpected error output: %s", string(out))
 		}
 	})
