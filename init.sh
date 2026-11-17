@@ -15,13 +15,14 @@ apt-get update
 apt-get install -y vim ca-certificates curl wget git unzip xz-utils htop tmux jq zsh build-essential clang pkg-config libssl-dev python3 python3-pip python3-venv python3-dev iproute2 iputils-ping dnsutils
 apt-get upgrade -y
 
-# 安装到运行脚本的 root 用户，不修改默认登录 shell。
+# 安装到运行脚本的 root 用户。
 if ! command -v docker >/dev/null; then
   curl -fsSL https://get.docker.com | sh
 fi
 if [[ ! -d "$HOME/.oh-my-zsh" ]]; then
   RUNZSH=no CHSH=no sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" -- --unattended
 fi
+chsh -s "$(command -v zsh)" root
 grep -qxF "alias dk='docker'" "$HOME/.zshrc" || echo "alias dk='docker'" >> "$HOME/.zshrc"
 
 if ! grep -qE '^\* soft nofile 327680$' /etc/security/limits.conf; then
@@ -76,10 +77,12 @@ fi
 
 export NVM_DIR="$HOME/.nvm"
 if [[ ! -s "$NVM_DIR/nvm.sh" ]]; then
-  curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.7/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.7/install.sh | PROFILE=/dev/null bash
 fi
 set +u
 . "$NVM_DIR/nvm.sh"
 nvm install --lts
 nvm alias default 'lts/*'
 set -u
+grep -qxF 'export NVM_DIR="$HOME/.nvm"' "$HOME/.zshrc" || echo 'export NVM_DIR="$HOME/.nvm"' >> "$HOME/.zshrc"
+grep -qxF '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"' "$HOME/.zshrc" || echo '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"' >> "$HOME/.zshrc"
