@@ -1,5 +1,9 @@
 # 更新记录
 
+## 0.5.1 — 2026-11-17
+
+- 修复异步设置 Ghostty 标签标题更新终端修改时间导致连接等待动画与计时停留在 `0.2s` 的问题，并在进入远端交互会话时及时清理残留等待提示。
+
 ## 0.5.0 — 2026-11-17
 
 - 新增服务器初始化脚本 `init.sh`（基于 `apt` 的 Debian/Ubuntu `root` 环境配置：常用工具、Docker、Oh My Zsh、`root` 与通配符 `nofile` 限制、内核参数/BBR、低内存自动创建 `/swapfile` 与 `nvm`/Node.js LTS），支持非交互 `dpkg` 选项、受限内核回退与 `set -euo pipefail` 安全执行。

@@ -34,6 +34,9 @@ func TestMain(m *testing.M) {
 		switch filepath.Base(os.Args[0]) {
 		case "osascript":
 			if len(os.Args) == 6 {
+				if delayMS, err := strconv.Atoi(os.Getenv("SSHTUI_TEST_OSASCRIPT_DELAY_MS")); err == nil && delayMS > 0 {
+					time.Sleep(time.Duration(delayMS) * time.Millisecond)
+				}
 				writeTestRecord(".title-set", os.Args[4:])
 				if os.Getenv("SSHTUI_TEST_TITLE_FAIL") == "1" {
 					os.Exit(1)
@@ -53,6 +56,10 @@ func TestMain(m *testing.M) {
 			if mode := os.Getenv("SSHTUI_TEST_CONNECTING"); mode != "" {
 				if mode == "failure" {
 					time.Sleep(400 * time.Millisecond)
+					os.Exit(255)
+				}
+				if mode == "slow-failure" {
+					time.Sleep(700 * time.Millisecond)
 					os.Exit(255)
 				}
 				time.Sleep(10 * time.Second)
@@ -1243,6 +1250,60 @@ exit [lindex $result 3]
 	}
 	if strings.Contains(string(out), "设置 Ghostty 标签标题失败") || strings.Contains(string(out), "恢复 Ghostty 标签标题失败") {
 		t.Fatalf("unexpected Ghostty error output when not running: %q", out)
+	}
+}
+
+func TestConnectionProgressContinuesDuringAsyncGhosttyTitle(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS != "darwin" {
+		t.Skip("Ghostty tab integration is macOS-only")
+	}
+	expect, err := exec.LookPath("expect")
+	if err != nil {
+		t.Skip("expect is not installed")
+	}
+	home, _ := configFixture(t, "servers:\n  - {name: Oracle-大阪, host: 192.0.2.1, auth: key}\n")
+	bin := t.TempDir()
+	binary, _ := os.Executable()
+	linkHelper(t, bin, "ssh", binary)
+	linkHelper(t, bin, "osascript", binary)
+	log := filepath.Join(t.TempDir(), "log")
+	driver := `
+set timeout 4
+spawn -noecho $env(SSHTUI_TEST_BINARY) Oracle-大阪
+expect {
+    -re {0\.[12]s} {}
+    timeout { puts stderr "Spinner did not start"; exit 101 }
+    eof { exit 102 }
+}
+expect {
+    -re {0\.[5-9]s} {}
+    timeout { puts stderr "Spinner froze around 0.2s after async Ghostty title write"; exit 103 }
+    eof { puts stderr "Spinner stopped advancing past 0.2s"; exit 104 }
+}
+expect {
+    eof {}
+    timeout { exit 105 }
+}
+set result [wait]
+exit [lindex $result 3]
+`
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, expect, "-c", driver)
+	cmd.Env = testEnv(map[string]string{
+		"HOME": home, "PATH": bin, "TERM": "xterm-256color", "TERM_PROGRAM": "ghostty", "TMUX": "",
+		"SSHTUI_TEST_PROCESS": "1", "SSHTUI_TEST_BINARY": binary, "SSHTUI_TEST_LOG": log,
+		"SSHTUI_TEST_OSASCRIPT_DELAY_MS": "180", "SSHTUI_TEST_CONNECTING": "slow-failure",
+	})
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil || err == nil || err.(*exec.ExitError).ExitCode() != 255 {
+		t.Fatalf("expected slow-failure exit 255 with advancing spinner, got %v; output: %q", err, out)
+	}
+	if !strings.HasSuffix(strings.Split(string(out), "\x1b[?2026l")[0], "\r\x1b[2K") {
+		if !strings.Contains(string(out), "\r\x1b[2K") {
+			t.Fatalf("spinner was not cleared on exit: %q", out)
+		}
 	}
 }
 

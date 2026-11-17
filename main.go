@@ -928,6 +928,8 @@ func runSSH(cmd *exec.Cmd, onStart ...func(pid int)) error {
 	return cmd.Wait()
 }
 
+var ttyMu sync.Mutex
+
 type connectionProgress struct {
 	done  chan struct{}
 	wg    sync.WaitGroup
@@ -945,14 +947,11 @@ func startConnectionProgress() *connectionProgress {
 	if err != nil {
 		return nil
 	}
-	var lastMtime time.Time
-	if info, err := os.Stderr.Stat(); err == nil {
-		lastMtime = info.ModTime()
-	}
 	p := &connectionProgress{done: make(chan struct{})}
 	start := time.Now()
 	style := lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8"))
 	frames := []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+	var lastMtime time.Time
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
@@ -965,22 +964,24 @@ func startConnectionProgress() *connectionProgress {
 			case <-ticker.C:
 				current, err := term.GetState(int(os.Stdin.Fd()))
 				if err != nil || *current != *state {
-					// Password prompts use /dev/tty directly; leave their cursor untouched.
+					ttyMu.Lock()
+					if p.drawn.Load() && !lastMtime.IsZero() {
+						if info, statErr := os.Stderr.Stat(); statErr == nil && info.ModTime().Equal(lastMtime) {
+							fmt.Fprint(os.Stderr, "\r\x1b[2K")
+						}
+					}
 					p.drawn.Store(false)
+					ttyMu.Unlock()
 					return
 				}
-				if p.drawn.Load() && !lastMtime.IsZero() {
-					if info, err := os.Stderr.Stat(); err == nil && !info.ModTime().Equal(lastMtime) {
-						p.drawn.Store(false)
-						return
-					}
-				}
 				line := fmt.Sprintf("  %c 正在连接 · 已等待 %.1fs", frames[frame%len(frames)], time.Since(start).Seconds())
+				ttyMu.Lock()
 				fmt.Fprintf(os.Stderr, "\r\x1b[2K%s\r", style.Render(line))
 				p.drawn.Store(true)
-				if info, err := os.Stderr.Stat(); err == nil {
+				if info, statErr := os.Stderr.Stat(); statErr == nil {
 					lastMtime = info.ModTime()
 				}
+				ttyMu.Unlock()
 			}
 		}
 	}()
@@ -991,7 +992,9 @@ func (p *connectionProgress) finish() {
 	close(p.done)
 	p.wg.Wait()
 	if p.drawn.Load() {
+		ttyMu.Lock()
 		fmt.Fprint(os.Stderr, "\r\x1b[2K")
+		ttyMu.Unlock()
 	}
 }
 
@@ -1073,7 +1076,9 @@ func pinGhosttyTabTitle(s *ServerConfig) func() {
 end run`, marker, title)
 		mu.Lock()
 		if err == nil && id != "" && active {
+			ttyMu.Lock()
 			_, _ = fmt.Fprintf(tty, "\x1b]2;%s\x1b\\", title)
+			ttyMu.Unlock()
 		}
 		mu.Unlock()
 		resCh <- pinResult{id: id, err: err}
@@ -1086,12 +1091,16 @@ end run`, marker, title)
 		mu.Unlock()
 		res := <-resCh
 		if res.err != nil {
+			ttyMu.Lock()
 			_, _ = fmt.Fprint(tty, "\x1b]2;\x1b\\")
+			ttyMu.Unlock()
 			fmt.Fprintf(os.Stderr, "设置 Ghostty 标签标题失败，继续连接: %v\n", res.err)
 			return
 		}
 		if res.id == "" {
+			ttyMu.Lock()
 			_, _ = fmt.Fprint(tty, "\x1b]2;\x1b\\")
+			ttyMu.Unlock()
 			return
 		}
 		_, err := ghosttyScript(`on run argv
@@ -1101,7 +1110,9 @@ end run`, marker, title)
 		end tell
 	end if
 end run`, res.id)
+		ttyMu.Lock()
 		_, _ = fmt.Fprint(tty, "\x1b]2;\x1b\\")
+		ttyMu.Unlock()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "恢复 Ghostty 标签标题失败: %v\n", err)
 		}
