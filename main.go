@@ -49,6 +49,7 @@ type ServerConfig struct {
 	Key         string   `yaml:"key"`
 	Password    string   `yaml:"password"`
 	Args        []string `yaml:"args"` // Additional SSH arguments.
+	Notes       string   `yaml:"notes,omitempty"`
 	Archived    bool     `yaml:"archived,omitempty"`
 	sourceIndex int
 }
@@ -334,6 +335,15 @@ func decodeConfig(raw []byte) (*Config, error) {
 				return nil, fmt.Errorf("服务器 %q 的显示字段不能包含控制字符", s.Name)
 			}
 		}
+		s.Notes = strings.ReplaceAll(s.Notes, "\r\n", "\n")
+		for _, r := range s.Notes {
+			if r == 0 {
+				return nil, fmt.Errorf("服务器 %q 的配置不能包含 NUL 字符", s.Name)
+			}
+			if unicode.IsControl(r) && r != '\n' && r != '\t' {
+				return nil, fmt.Errorf("服务器 %q 的备注不能包含控制字符", s.Name)
+			}
+		}
 		if err := validatePassword(s.Password); err != nil {
 			return nil, fmt.Errorf("服务器 %q: %w", s.Name, err)
 		}
@@ -346,18 +356,37 @@ func decodeConfig(raw []byte) (*Config, error) {
 	return &cfg, nil
 }
 
+type probeDebounceMsg struct {
+	seq  int
+	key  string
+	host string
+	port int
+}
+
+type latencyResultMsg struct {
+	key    string
+	result latencyResult
+}
+
 type model struct {
 	config       *Config
 	filter       string
 	filtered     []ServerConfig
 	cursor       int
 	viewportTop  int
+	splitLineTop int
 	selected     *ServerConfig
 	width        int
 	height       int
 	quitting     bool
 	showArchived bool
 	status       string
+	latency      map[string]latencyState
+	probeSeq     int
+	probeFn      func(context.Context, string, int) latencyResult
+	editingNotes bool
+	noteBuf      []rune
+	notePos      int
 }
 
 func sanitizeFilter(s string) string {
@@ -379,9 +408,17 @@ func initialModel(cfg *Config, initialFilter string) model {
 		viewportTop: 0,
 		height:      24,
 		width:       80,
+		latency:     make(map[string]latencyState),
 	}
 	m.applyFilter()
 	return m
+}
+
+func groupSortRank(group string) string {
+	if strings.EqualFold(group, "Default") {
+		return "\xff"
+	}
+	return strings.ToLower(group)
 }
 
 func (m *model) applyFilter() {
@@ -391,24 +428,90 @@ func (m *model) applyFilter() {
 		if s.Archived && !m.showArchived {
 			continue
 		}
-		target := strings.ToLower(fmt.Sprintf("%s %s %s %s", s.Name, s.Group, s.Host, s.User))
+		target := strings.ToLower(fmt.Sprintf("%s %s %s %s %s", s.Name, s.Group, s.Host, s.User, s.Notes))
 		if strings.Contains(target, lowerFilter) {
 			m.filtered = append(m.filtered, s)
 		}
 	}
+	slices.SortStableFunc(m.filtered, func(a, b ServerConfig) int {
+		if a.Group == b.Group {
+			return 0
+		}
+		return cmp.Or(
+			strings.Compare(groupSortRank(a.Group), groupSortRank(b.Group)),
+			strings.Compare(a.Group, b.Group),
+		)
+	})
 
 	m.cursor = max(0, min(m.cursor, len(m.filtered)-1))
 	m.adjustViewport()
 }
 
-func (m *model) listLayout() (rows, columns int) {
-	rows = max(1, m.height-9)
-	columns = 1
-	if m.width < 74 || m.height < 14 || len(m.filtered) > rows {
-		rows = max(1, m.height-3)
-		// Keep each column wide enough for a name and connection details.
-		columns = min(max(1, (len(m.filtered)+rows-1)/rows), max(1, (m.width+2)/34))
+func (m model) isSplitView() bool {
+	return m.width >= 80 && m.height >= 16
+}
+
+func (m model) splitDimensions() (leftW, rightW, bodyH, listH int) {
+	footerLines := 1
+	if m.height >= 22 {
+		footerLines = 2
 	}
+	bodyH = max(1, m.height-footerLines)
+	availW := max(2, m.width-3)
+	rightW = min(46, max(29, availW*37/100))
+	leftW = max(1, availW-rightW)
+	topChrome := 4
+	if bodyH >= 19 {
+		topChrome = 5
+	}
+	listH = max(1, bodyH-topChrome)
+	return leftW, rightW, bodyH, listH
+}
+
+type leftItemKind uint8
+
+const (
+	leftItemServer leftItemKind = iota
+	leftItemGroup
+	leftItemSpacer
+)
+
+type leftVisualItem struct {
+	kind      leftItemKind
+	group     string
+	count     int
+	serverIdx int
+}
+
+func (m model) buildLeftItems() []leftVisualItem {
+	if len(m.filtered) == 0 {
+		return nil
+	}
+	counts := make(map[string]int)
+	for _, s := range m.filtered {
+		counts[s.Group]++
+	}
+	items := make([]leftVisualItem, 0, len(m.filtered)+len(counts)*2)
+	for i, s := range m.filtered {
+		if i == 0 || s.Group != m.filtered[i-1].Group {
+			if i > 0 {
+				items = append(items, leftVisualItem{kind: leftItemSpacer})
+			}
+			items = append(items, leftVisualItem{kind: leftItemGroup, group: s.Group, count: counts[s.Group]})
+		}
+		items = append(items, leftVisualItem{kind: leftItemServer, serverIdx: i})
+	}
+	return items
+}
+
+func (m *model) listLayout() (rows, columns int) {
+	if m.isSplitView() {
+		_, _, _, listH := m.splitDimensions()
+		return listH, 1
+	}
+	rows = max(1, m.height-3)
+	// Keep each column wide enough for a name and connection details.
+	columns = min(max(1, (len(m.filtered)+rows-1)/rows), max(1, (m.width+2)/34))
 	return rows, columns
 }
 
@@ -421,24 +524,101 @@ func (m *model) adjustViewport() {
 	visible := m.maxVisibleItems()
 	if len(m.filtered) <= visible {
 		m.viewportTop = 0
-		return
+	} else {
+		if m.cursor < m.viewportTop {
+			m.viewportTop = m.cursor
+		} else if m.cursor >= m.viewportTop+visible {
+			m.viewportTop = m.cursor - visible + 1
+		}
+		if maxTop := len(m.filtered) - visible; m.viewportTop > maxTop {
+			m.viewportTop = maxTop
+		}
+		if m.viewportTop < 0 {
+			m.viewportTop = 0
+		}
 	}
 
-	if m.cursor < m.viewportTop {
-		m.viewportTop = m.cursor
-	} else if m.cursor >= m.viewportTop+visible {
-		m.viewportTop = m.cursor - visible + 1
+	_, _, _, listH := m.splitDimensions()
+	items := m.buildLeftItems()
+	if len(items) <= listH {
+		m.splitLineTop = 0
+		return
 	}
-	if maxTop := len(m.filtered) - visible; m.viewportTop > maxTop {
-		m.viewportTop = maxTop
+	curLine := 0
+	for i, it := range items {
+		if it.kind == leftItemServer && it.serverIdx == m.cursor {
+			curLine = i
+			break
+		}
 	}
-	if m.viewportTop < 0 {
-		m.viewportTop = 0
+	wantTop := curLine
+	if curLine > 0 && items[curLine-1].kind == leftItemGroup && listH >= 2 {
+		wantTop = curLine - 1
+	}
+	if wantTop < m.splitLineTop {
+		m.splitLineTop = wantTop
+	} else if curLine >= m.splitLineTop+listH {
+		m.splitLineTop = curLine - listH + 1
+	}
+	m.splitLineTop = max(0, min(m.splitLineTop, len(items)-listH))
+}
+
+const latencyCacheTTL = 20 * time.Second
+
+func serverProbeKey(s ServerConfig) string {
+	return fmt.Sprintf("%d:%s:%d", s.sourceIndex, s.Host, s.Port)
+}
+
+func (m *model) scheduleProbe(debounce bool) tea.Cmd {
+	if len(m.filtered) == 0 || m.cursor < 0 || m.cursor >= len(m.filtered) {
+		return nil
+	}
+	s := m.filtered[m.cursor]
+	if s.Archived {
+		return nil
+	}
+	if m.latency == nil {
+		m.latency = make(map[string]latencyState)
+	}
+	key := serverProbeKey(s)
+	st := m.latency[key]
+	if st.HasData && time.Since(st.Result.At) < latencyCacheTTL {
+		return nil
+	}
+	st.Probing = true
+	m.latency[key] = st
+	m.probeSeq++
+	seq := m.probeSeq
+	if debounce {
+		return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg {
+			return probeDebounceMsg{seq: seq, key: key, host: s.Host, port: s.Port}
+		})
+	}
+	return m.runProbeCmd(key, s.Host, s.Port)
+}
+
+func (m model) runProbeCmd(key, host string, port int) tea.Cmd {
+	fn := m.probeFn
+	if fn == nil {
+		fn = probeServerLatency
+	}
+	return func() tea.Msg {
+		return latencyResultMsg{key: key, result: fn(context.Background(), host, port)}
+	}
+}
+
+func (m *model) selectBySourceIndex(sourceIdx int) {
+	for i, s := range m.filtered {
+		if s.sourceIndex == sourceIdx {
+			m.cursor = i
+			m.adjustViewport()
+			return
+		}
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	return nil
+	return m.scheduleProbe(false)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -449,7 +629,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.adjustViewport()
 		return m, nil
 
+	case probeDebounceMsg:
+		if msg.seq != m.probeSeq {
+			return m, nil
+		}
+		return m, m.runProbeCmd(msg.key, msg.host, msg.port)
+
+	case latencyResultMsg:
+		if m.latency == nil {
+			m.latency = make(map[string]latencyState)
+		}
+		m.latency[msg.key] = latencyState{
+			Probing: false,
+			HasData: true,
+			Result:  msg.result,
+		}
+		return m, nil
+
 	case tea.KeyMsg:
+		if m.editingNotes {
+			return m.updateNoteEditor(msg)
+		}
 		m.status = ""
 		switch msg.Type {
 		case tea.KeyF2:
@@ -468,13 +668,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = "已恢复"
 			}
 			m.applyFilter()
-			return m, nil
+			if target.Archived {
+				m.selectBySourceIndex(target.sourceIndex)
+			}
+			return m, m.scheduleProbe(true)
 
 		case tea.KeyF3:
 			m.showArchived = !m.showArchived
 			m.status = ""
 			m.applyFilter()
+			return m, m.scheduleProbe(true)
+
+		case tea.KeyF4, tea.KeyCtrlE, tea.KeyTab:
+			if len(m.filtered) == 0 {
+				return m, nil
+			}
+			s := m.filtered[m.cursor]
+			m.editingNotes = true
+			m.noteBuf = []rune(s.Notes)
+			m.notePos = len(m.noteBuf)
 			return m, nil
+
+		case tea.KeyF5, tea.KeyCtrlR:
+			if len(m.filtered) == 0 {
+				return m, nil
+			}
+			s := m.filtered[m.cursor]
+			if !s.Archived && m.latency != nil {
+				delete(m.latency, serverProbeKey(s))
+			}
+			return m, m.scheduleProbe(false)
 
 		case tea.KeyCtrlC:
 			m.quitting = true
@@ -484,7 +707,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.filter != "" {
 				m.filter = ""
 				m.applyFilter()
-				return m, nil
+				return m, m.scheduleProbe(true)
 			}
 			m.quitting = true
 			return m, tea.Quit
@@ -496,7 +719,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor = len(m.filtered) - 1
 			}
 			m.adjustViewport()
-			return m, nil
+			return m, m.scheduleProbe(true)
 
 		case tea.KeyDown, tea.KeyCtrlN:
 			if m.cursor < len(m.filtered)-1 {
@@ -505,16 +728,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor = 0
 			}
 			m.adjustViewport()
-			return m, nil
+			return m, m.scheduleProbe(true)
+
+		case tea.KeyPgUp:
+			if len(m.filtered) > 0 {
+				step := max(1, m.maxVisibleItems()-1)
+				m.cursor = max(0, m.cursor-step)
+				m.adjustViewport()
+			}
+			return m, m.scheduleProbe(true)
+
+		case tea.KeyPgDown:
+			if len(m.filtered) > 0 {
+				step := max(1, m.maxVisibleItems()-1)
+				m.cursor = min(len(m.filtered)-1, m.cursor+step)
+				m.adjustViewport()
+			}
+			return m, m.scheduleProbe(true)
 
 		case tea.KeyLeft, tea.KeyRight:
 			rows, columns := m.listLayout()
+			moved := false
 			if columns > 1 && msg.Type == tea.KeyLeft && m.cursor >= rows {
 				m.cursor -= rows
+				moved = true
 			} else if columns > 1 && msg.Type == tea.KeyRight && m.cursor+rows < len(m.filtered) {
 				m.cursor += rows
+				moved = true
 			}
 			m.adjustViewport()
+			if moved {
+				return m, m.scheduleProbe(true)
+			}
 			return m, nil
 
 		case tea.KeyEnter:
@@ -533,6 +778,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				r := []rune(m.filter)
 				m.filter = string(r[:len(r)-1])
 				m.applyFilter()
+				return m, m.scheduleProbe(true)
 			}
 			return m, nil
 
@@ -540,6 +786,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !msg.Alt {
 				m.filter += " "
 				m.applyFilter()
+				return m, m.scheduleProbe(true)
 			}
 			return m, nil
 
@@ -547,12 +794,189 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !msg.Alt {
 				m.filter += sanitizeFilter(string(msg.Runes))
 				m.applyFilter()
+				return m, m.scheduleProbe(true)
 			}
 			return m, nil
 		}
 	}
 
 	return m, nil
+}
+
+func (m model) updateNoteEditor(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyCtrlC:
+		m.quitting = true
+		return m, tea.Quit
+
+	case tea.KeyEsc:
+		m.editingNotes = false
+		m.noteBuf = nil
+		m.notePos = 0
+		m.status = ""
+		return m, nil
+
+	case tea.KeyCtrlS, tea.KeyF4:
+		if len(m.filtered) == 0 || m.cursor >= len(m.filtered) {
+			m.editingNotes = false
+			return m, nil
+		}
+		target := m.filtered[m.cursor]
+		cfg, err := setServerNotes(target, string(m.noteBuf))
+		if err != nil {
+			m.status = strings.Join(strings.Fields(sanitizeFilter("保存失败: "+err.Error())), " ")
+			return m, nil
+		}
+		m.config = cfg
+		m.editingNotes = false
+		m.noteBuf = nil
+		m.notePos = 0
+		m.status = "备注已保存"
+		m.applyFilter()
+		m.selectBySourceIndex(target.sourceIndex)
+		return m, nil
+
+	case tea.KeyEnter, tea.KeyCtrlJ:
+		m.insertNoteRunes([]rune{'\n'})
+		return m, nil
+
+	case tea.KeyBackspace:
+		if m.notePos > 0 {
+			m.noteBuf = append(m.noteBuf[:m.notePos-1], m.noteBuf[m.notePos:]...)
+			m.notePos--
+		}
+		return m, nil
+
+	case tea.KeyDelete, tea.KeyCtrlD:
+		if m.notePos < len(m.noteBuf) {
+			m.noteBuf = append(m.noteBuf[:m.notePos], m.noteBuf[m.notePos+1:]...)
+		}
+		return m, nil
+
+	case tea.KeyLeft, tea.KeyCtrlB:
+		if m.notePos > 0 {
+			m.notePos--
+		}
+		return m, nil
+
+	case tea.KeyRight, tea.KeyCtrlF:
+		if m.notePos < len(m.noteBuf) {
+			m.notePos++
+		}
+		return m, nil
+
+	case tea.KeyUp, tea.KeyCtrlP:
+		m.notePos = moveNoteCursorVertical(m.noteBuf, m.notePos, -1)
+		return m, nil
+
+	case tea.KeyDown, tea.KeyCtrlN:
+		m.notePos = moveNoteCursorVertical(m.noteBuf, m.notePos, 1)
+		return m, nil
+
+	case tea.KeyHome, tea.KeyCtrlA:
+		start, _, _ := noteLineBounds(m.noteBuf, m.notePos)
+		m.notePos = start
+		return m, nil
+
+	case tea.KeyEnd, tea.KeyCtrlE:
+		_, end, _ := noteLineBounds(m.noteBuf, m.notePos)
+		m.notePos = end
+		return m, nil
+
+	case tea.KeyCtrlU:
+		start, _, _ := noteLineBounds(m.noteBuf, m.notePos)
+		if m.notePos > start {
+			m.noteBuf = append(m.noteBuf[:start], m.noteBuf[m.notePos:]...)
+			m.notePos = start
+		}
+		return m, nil
+
+	case tea.KeyCtrlK:
+		_, end, _ := noteLineBounds(m.noteBuf, m.notePos)
+		if end > m.notePos {
+			m.noteBuf = append(m.noteBuf[:m.notePos], m.noteBuf[end:]...)
+		}
+		return m, nil
+
+	case tea.KeySpace:
+		if !msg.Alt {
+			m.insertNoteRunes([]rune{' '})
+		}
+		return m, nil
+
+	case tea.KeyTab:
+		m.insertNoteRunes([]rune{' ', ' '})
+		return m, nil
+
+	case tea.KeyRunes:
+		if !msg.Alt {
+			if cleaned := sanitizeNoteInput(string(msg.Runes)); len(cleaned) > 0 {
+				m.insertNoteRunes(cleaned)
+			}
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m *model) insertNoteRunes(ins []rune) {
+	if len(ins) == 0 {
+		return
+	}
+	next := make([]rune, 0, len(m.noteBuf)+len(ins))
+	next = append(next, m.noteBuf[:m.notePos]...)
+	next = append(next, ins...)
+	next = append(next, m.noteBuf[m.notePos:]...)
+	m.noteBuf = next
+	m.notePos += len(ins)
+}
+
+const (
+	uiCyan       = lipgloss.Color("#22d3ee")
+	uiPurple     = lipgloss.Color("#a855f7")
+	uiPurpleSoft = lipgloss.Color("#c084fc")
+	uiPurpleBg   = lipgloss.Color("#2a1b4e")
+	uiSelectedBg = lipgloss.Color("#2e1d59")
+	uiGreen      = lipgloss.Color("#34d399")
+	uiGreenBg    = lipgloss.Color("#0a362b")
+	uiAmber      = lipgloss.Color("#fbbf24")
+	uiAmberBg    = lipgloss.Color("#3b2a0e")
+	uiRed        = lipgloss.Color("#f87171")
+	uiRedBg      = lipgloss.Color("#3b1520")
+	uiText       = lipgloss.Color("#f8fafc")
+	uiSubText    = lipgloss.Color("#cbd5e1")
+	uiDim        = lipgloss.Color("#64748b")
+	uiBorderDim  = lipgloss.Color("#2d3748")
+	uiNoteBorder = lipgloss.Color("#4c3575")
+	uiDivider    = lipgloss.Color("#1e293b")
+)
+
+func padStyledRight(s string, width int) string {
+	w := lipgloss.Width(s)
+	if w >= width {
+		return s
+	}
+	return s + strings.Repeat(" ", width-w)
+}
+
+func renderRoundedBox(contentLines []string, outerWidth int, borderColor lipgloss.Color) []string {
+	if outerWidth < 4 {
+		return nil
+	}
+	innerW := outerWidth - 4
+	bStyle := lipgloss.NewStyle().Foreground(borderColor)
+	top := bStyle.Render("╭" + strings.Repeat("─", outerWidth-2) + "╮")
+	bottom := bStyle.Render("╰" + strings.Repeat("─", outerWidth-2) + "╯")
+	leftBar := bStyle.Render("│ ")
+	rightBar := bStyle.Render(" │")
+
+	out := make([]string, 0, len(contentLines)+2)
+	out = append(out, top)
+	for _, cl := range contentLines {
+		out = append(out, leftBar+padStyledRight(cl, innerW)+rightBar)
+	}
+	out = append(out, bottom)
+	return out
 }
 
 func (m model) View() string {
@@ -562,81 +986,429 @@ func (m model) View() string {
 	if m.width < 16 || m.height < 4 {
 		return runewidth.Truncate("窗口过小，请放大", max(0, m.width), "")
 	}
-	if m.width < 74 || m.height < 14 || len(m.filtered) > m.height-9 {
+	if !m.isSplitView() {
 		return m.compactView()
 	}
 
-	primaryColor := lipgloss.Color("#38bdf8")
-	accentColor := lipgloss.Color("#a855f7")
-	dimColor := lipgloss.Color("#64748b")
-	textColor := lipgloss.Color("#f8fafc")
-	selectedBg := lipgloss.Color("#1e293b")
-	keyBadgeColor := lipgloss.Color("#34d399")
-	passBadgeColor := lipgloss.Color("#fbbf24")
+	leftW, rightW, bodyH, listH := m.splitDimensions()
+	leftLines := m.renderLeftPane(leftW, bodyH, listH)
+	rightLines := m.renderRightPane(rightW, bodyH)
 
-	headerBox := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("#475569")).
-		Padding(0, 1).
-		Width(72)
+	sep := lipgloss.NewStyle().Foreground(uiDivider).Render(" │ ")
+	lines := make([]string, 0, m.height)
+	for i := range bodyH {
+		var l, r string
+		if i < len(leftLines) {
+			l = leftLines[i]
+		}
+		if i < len(rightLines) {
+			r = rightLines[i]
+		}
+		lines = append(lines, padStyledRight(l, leftW)+sep+r)
+	}
+	if m.height >= 22 {
+		lines = append(lines, "")
+	}
+	lines = append(lines, m.renderFooterLine(m.width))
+	return strings.Join(lines, "\n")
+}
 
-	searchPrompt := lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render("❯ Filter: ")
-	searchText := lipgloss.NewStyle().Foreground(textColor).Render(truncateLeft(m.filter, 56))
-	cursorBlock := lipgloss.NewStyle().Foreground(primaryColor).Render("▋")
-	searchBar := headerBox.Render(searchPrompt + searchText + cursorBlock)
+func (m model) renderLeftPane(leftW, bodyH, listH int) []string {
+	lines := make([]string, 0, bodyH)
 
-	title := lipgloss.NewStyle().Bold(true).Foreground(primaryColor).Render("⚡ GHOSTTY SSH PICKER")
-	subTitle := lipgloss.NewStyle().Foreground(dimColor).Render("  F2 归档/恢复 · F3 显示/隐藏归档")
-	head := title + subTitle
-
-	var b strings.Builder
-	b.WriteString("\n" + head + "\n" + searchBar + "\n\n")
-
-	if len(m.filtered) == 0 {
-		emptyMsg := lipgloss.NewStyle().
-			Foreground(dimColor).
-			Italic(true).
-			PaddingLeft(3).
-			Render("未找到匹配的服务器 (按 Esc 清空输入)")
-		b.WriteString(emptyMsg + "\n\n")
-	} else {
-		visible := m.maxVisibleItems()
-		end := min(len(m.filtered), m.viewportTop+visible)
-
-		for i := m.viewportTop; i < end; i++ {
-			s := m.filtered[i]
-			isSelected := (i == m.cursor)
-
-			nameColor, connColor := textColor, dimColor
-			prefix := "   "
-			rowStyle := lipgloss.NewStyle().Padding(0, 1)
-			if isSelected {
-				nameColor, connColor = primaryColor, textColor
-				prefix = lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render(" ❯ ")
-				rowStyle = rowStyle.Background(selectedBg)
-			}
-			authBadge := lipgloss.NewStyle().Foreground(keyBadgeColor).Render("🔑 密钥")
-			if s.Auth == "password" {
-				authBadge = lipgloss.NewStyle().Foreground(passBadgeColor).Render("🔒 密码")
-			}
-			if s.Archived {
-				nameColor, connColor = dimColor, dimColor
-				authBadge = lipgloss.NewStyle().Foreground(dimColor).Render("[已归档]")
-			}
-			content := fmt.Sprintf("%s %s %s %s",
-				lipgloss.NewStyle().Foreground(accentColor).Bold(isSelected).Render(fitColumn("["+s.Group+"]", 9)),
-				lipgloss.NewStyle().Foreground(nameColor).Bold(isSelected).Render(fitColumn(s.Name, 20)),
-				lipgloss.NewStyle().Foreground(connColor).Render(fitColumn(formatEndpoint(s.User, s.Host, s.Port), 23)),
-				authBadge)
-			line := prefix + rowStyle.Render(content)
-			b.WriteString(line + "\n")
+	// 1. Header bar
+	titleText := "⚡ GHOSTTY SSH PICKER"
+	archiveHint := "F3 显示归档"
+	if m.showArchived {
+		archiveHint = "F3 隐藏归档"
+	}
+	titleStyled := lipgloss.NewStyle().Bold(true).Foreground(uiCyan).Render(runewidth.Truncate(titleText, leftW, "…"))
+	titleW := lipgloss.Width(titleStyled)
+	remHead := leftW - titleW
+	if remHead >= 16 {
+		keyPill := lipgloss.NewStyle().Foreground(uiSubText).Background(uiDivider)
+		dimSt := lipgloss.NewStyle().Foreground(uiDim)
+		fullSub := "  │  " + keyPill.Render(" F2 ") + dimSt.Render(" 归档/恢复 · ") + keyPill.Render(" F3 ") + dimSt.Render(" "+strings.TrimPrefix(archiveHint, "F3 "))
+		if lipgloss.Width(fullSub) <= remHead {
+			titleStyled += fullSub
+		} else {
+			shortPlain := runewidth.Truncate(" │ F2 归档 · "+archiveHint, remHead, "…")
+			titleStyled += dimSt.Render(shortPlain)
 		}
 	}
+	lines = append(lines, titleStyled)
 
-	b.WriteString("\n")
-	b.WriteString("  " + runewidth.Truncate(m.footer(), m.width-2, "…") + "\n")
+	// 2. Search bar (3 lines)
+	searchBorder := uiCyan
+	if m.editingNotes {
+		searchBorder = uiBorderDim
+	}
+	innerSearchW := max(1, leftW-4)
+	icon := lipgloss.NewStyle().Foreground(uiCyan).Render("⌕ ")
+	var searchContent string
+	if m.filter == "" {
+		placeholder := runewidth.Truncate("Filter hosts...", max(0, innerSearchW-2), "")
+		if m.editingNotes {
+			searchContent = lipgloss.NewStyle().Foreground(uiDim).Render("⌕ " + placeholder)
+		} else {
+			searchContent = icon + lipgloss.NewStyle().Foreground(uiDim).Render(placeholder)
+		}
+	} else {
+		textMax := max(0, innerSearchW-3)
+		shown := truncateLeft(m.filter, textMax)
+		cur := ""
+		if !m.editingNotes && innerSearchW >= 3 {
+			cur = lipgloss.NewStyle().Foreground(uiCyan).Render("▋")
+		}
+		searchContent = icon + lipgloss.NewStyle().Foreground(uiText).Render(shown) + cur
+	}
+	lines = append(lines, renderRoundedBox([]string{searchContent}, leftW, searchBorder)...)
 
-	return b.String()
+	if bodyH >= 19 {
+		lines = append(lines, "")
+	}
+
+	// 3. Grouped server list
+	if len(m.filtered) == 0 {
+		msg := runewidth.Truncate("  未找到匹配的服务器 (按 Esc 清空输入)", leftW, "…")
+		lines = append(lines, lipgloss.NewStyle().Foreground(uiDim).Italic(true).Render(msg))
+		return lines
+	}
+
+	items := m.buildLeftItems()
+	end := min(len(items), m.splitLineTop+listH)
+	for _, it := range items[m.splitLineTop:end] {
+		switch it.kind {
+		case leftItemSpacer:
+			lines = append(lines, "")
+		case leftItemGroup:
+			lines = append(lines, m.renderGroupHeader(it.group, it.count, leftW))
+		case leftItemServer:
+			s := m.filtered[it.serverIdx]
+			lines = append(lines, m.renderServerRow(s, it.serverIdx == m.cursor, leftW))
+		}
+	}
+	return lines
+}
+
+func (m model) renderGroupHeader(group string, count, leftW int) string {
+	chev := lipgloss.NewStyle().Foreground(uiDim).Render("▾ ")
+	maxGroupW := max(4, leftW-12)
+	gName := runewidth.Truncate(group, maxGroupW, "…")
+	gBadge := lipgloss.NewStyle().Foreground(uiPurpleSoft).Background(uiPurpleBg).Bold(true).Render(" " + gName + " ")
+	cBadge := lipgloss.NewStyle().Foreground(uiSubText).Background(uiDivider).Render(fmt.Sprintf(" %d ", count))
+	head := chev + gBadge + " " + cBadge
+	rem := leftW - lipgloss.Width(head) - 1
+	if rem >= 3 {
+		head += " " + lipgloss.NewStyle().Foreground(uiDivider).Render(strings.Repeat("─", rem))
+	}
+	return head
+}
+
+func (m model) renderServerRow(s ServerConfig, isSelected bool, leftW int) string {
+	wide := leftW >= 58
+	prefixPlain := " ▫ "
+	if wide {
+		prefixPlain = "  ▫ "
+	}
+	if isSelected {
+		if wide {
+			prefixPlain = "  ▪ "
+		} else {
+			prefixPlain = " ▪ "
+		}
+	}
+	prefixW := runewidth.StringWidth(prefixPlain)
+
+	var badgePlain string
+	badgeFg, badgeBg := uiGreen, uiGreenBg
+	if s.Auth == "password" {
+		badgeFg, badgeBg = uiAmber, uiAmberBg
+		if wide {
+			badgePlain = " 🔒 密码 "
+		} else {
+			badgePlain = "🔒 密码"
+		}
+	} else {
+		if wide {
+			badgePlain = " 🔑 密钥 "
+		} else {
+			badgePlain = "🔑 密钥"
+		}
+	}
+	if s.Archived {
+		badgeFg, badgeBg = uiDim, uiDivider
+		if wide {
+			badgePlain = " [已归档] "
+		} else {
+			badgePlain = "[已归档]"
+		}
+	}
+	badgeW := runewidth.StringWidth(badgePlain)
+
+	gap := " "
+	if wide {
+		gap = "  "
+	}
+	gapW := len(gap)
+
+	rem := max(4, leftW-prefixW-badgeW-gapW*2-1)
+	endpointFull := formatEndpoint(s.User, s.Host, s.Port)
+	endpointW := min(max(20, rem*56/100), max(2, rem-10))
+	nameW := max(2, rem-endpointW)
+
+	nameCell := fitColumn(inventoryName(s), nameW)
+	endpointCell := fitColumn(endpointFull, endpointW)
+	trailSpaces := max(0, leftW-prefixW-nameW-gapW-endpointW-gapW-badgeW)
+
+	if isSelected {
+		rowBg := uiSelectedBg
+		iconColor := uiPurpleSoft
+		nameColor := uiText
+		connColor := uiSubText
+		if s.Archived {
+			iconColor, nameColor, connColor = uiDim, uiDim, uiDim
+		}
+		pSt := lipgloss.NewStyle().Foreground(iconColor).Background(rowBg).Bold(true)
+		nSt := lipgloss.NewStyle().Foreground(nameColor).Background(rowBg).Bold(true)
+		cSt := lipgloss.NewStyle().Foreground(connColor).Background(rowBg)
+		gSt := lipgloss.NewStyle().Background(rowBg)
+		bSt := lipgloss.NewStyle().Foreground(badgeFg).Background(rowBg).Bold(!s.Archived)
+		return pSt.Render(prefixPlain) +
+			nSt.Render(nameCell) +
+			gSt.Render(gap) +
+			cSt.Render(endpointCell) +
+			gSt.Render(gap) +
+			bSt.Render(badgePlain) +
+			gSt.Render(strings.Repeat(" ", trailSpaces))
+	}
+
+	iconColor, nameColor, connColor := uiDim, uiText, uiDim
+	if s.Archived {
+		nameColor = uiDim
+	}
+	pSt := lipgloss.NewStyle().Foreground(iconColor)
+	nSt := lipgloss.NewStyle().Foreground(nameColor)
+	cSt := lipgloss.NewStyle().Foreground(connColor)
+	bSt := lipgloss.NewStyle().Foreground(badgeFg)
+	if wide {
+		bSt = bSt.Background(badgeBg)
+	}
+	return pSt.Render(prefixPlain) +
+		nSt.Render(nameCell) +
+		gap +
+		cSt.Render(endpointCell) +
+		gap +
+		bSt.Render(badgePlain)
+}
+
+func (m model) renderRightPane(rightW, bodyH int) []string {
+	lines := make([]string, 0, bodyH)
+	if len(m.filtered) == 0 || m.cursor >= len(m.filtered) {
+		msg := runewidth.Truncate(" 暂无选中服务器", rightW, "…")
+		lines = append(lines, lipgloss.NewStyle().Foreground(uiDim).Render(msg))
+		return lines
+	}
+
+	s := m.filtered[m.cursor]
+	divLine := lipgloss.NewStyle().Foreground(uiDivider).Render(strings.Repeat("─", rightW))
+	spacious := bodyH >= 25
+
+	// 1. Server Title Header
+	iconBadge := lipgloss.NewStyle().Foreground(uiPurpleSoft).Background(uiPurpleBg).Bold(true).Render(" ⊡ ")
+	titleName := runewidth.Truncate(inventoryName(s), max(1, rightW-4), "…")
+	nameStyle := lipgloss.NewStyle().Bold(true).Foreground(uiText)
+	if s.Archived {
+		nameStyle = nameStyle.Foreground(uiDim)
+	}
+	lines = append(lines, iconBadge+" "+nameStyle.Render(titleName))
+	if bodyH >= 19 {
+		lines = append(lines, "")
+	}
+
+	// 2. Detail fields: Host, Username, Auth, Group
+	lblSt := lipgloss.NewStyle().Foreground(uiDim)
+	valSt := lipgloss.NewStyle().Foreground(uiText)
+	subValSt := lipgloss.NewStyle().Foreground(uiSubText)
+	valMax := max(1, rightW-9)
+
+	hostEndpoint := net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
+	lines = append(lines, lblSt.Render(" ⊡ Host  ")+valSt.Render(runewidth.Truncate(hostEndpoint, valMax, "…")))
+	lines = append(lines, lblSt.Render(" @ User  ")+subValSt.Render(runewidth.Truncate(s.User, valMax, "…")))
+
+	var authPill string
+	if s.Archived {
+		authPill = lipgloss.NewStyle().Foreground(uiDim).Background(uiDivider).Render(" 已归档 ")
+	} else if s.Auth == "password" {
+		authPill = lipgloss.NewStyle().Foreground(uiAmber).Background(uiAmberBg).Render(" 🔒 密码 ")
+	} else {
+		authPill = lipgloss.NewStyle().Foreground(uiGreen).Background(uiGreenBg).Render(" 🔑 密钥 ")
+	}
+	lines = append(lines, lblSt.Render(" ⚷ Auth  ")+authPill)
+
+	grpText := runewidth.Truncate(s.Group, max(1, valMax-2), "…")
+	grpPill := lipgloss.NewStyle().Foreground(uiPurpleSoft).Background(uiPurpleBg).Render(" " + grpText + " ")
+	lines = append(lines, lblSt.Render(" ⌗ Group ")+grpPill)
+
+	// 3. Latency Section
+	if spacious {
+		lines = append(lines, "")
+	}
+	lines = append(lines, divLine)
+	if spacious {
+		lines = append(lines, "")
+	}
+
+	latHeader := lipgloss.NewStyle().Foreground(uiPurple).Render(" ∿ ") +
+		lipgloss.NewStyle().Foreground(uiSubText).Render(runewidth.Truncate("延迟 (ICMP/TCP)", max(1, rightW-3), "…"))
+	lines = append(lines, latHeader)
+	lines = append(lines, m.renderLatencyLine(s, rightW))
+
+	// 4. Notes Section
+	if spacious {
+		lines = append(lines, "")
+	}
+	lines = append(lines, divLine)
+	if spacious && bodyH >= 28 {
+		lines = append(lines, "")
+	}
+
+	lines = append(lines, m.renderNotesHeader(rightW))
+
+	remForBox := bodyH - len(lines)
+	if remForBox >= 3 {
+		noteInnerH := min(8, remForBox-2)
+		if m.editingNotes {
+			noteInnerH = min(10, remForBox-2)
+		}
+		lines = append(lines, m.renderNotesCard(s, rightW, noteInnerH)...)
+	}
+	return lines
+}
+
+func (m model) renderLatencyLine(s ServerConfig, rightW int) string {
+	dimBarSt := lipgloss.NewStyle().Foreground(uiBorderDim)
+	if s.Archived {
+		return lipgloss.NewStyle().Foreground(uiDim).Render(runewidth.Truncate("   已归档 · 不探测", rightW, "…"))
+	}
+
+	st := m.latency[serverProbeKey(s)]
+	var leftPart string
+	var bars string
+
+	switch {
+	case !st.HasData:
+		leftPart = "   " + lipgloss.NewStyle().Foreground(uiCyan).Render("检测中...")
+		bars = dimBarSt.Render("▁▂▃▄▅▆")
+	case st.Result.Err != nil:
+		leftPart = "   " + lipgloss.NewStyle().Foreground(uiRed).Bold(true).Render("超时 / 不可达")
+		bars = dimBarSt.Render("▁▁▁▁▁▁")
+	default:
+		rtt := st.Result.RTT
+		ms := rtt.Milliseconds()
+		color, bg := uiGreen, uiGreenBg
+		lit := 6
+		switch {
+		case ms < 50:
+			color, bg, lit = uiGreen, uiGreenBg, 6
+		case ms < 100:
+			color, bg, lit = uiGreen, uiGreenBg, 5
+		case ms < 180:
+			color, bg, lit = uiAmber, uiAmberBg, 4
+		case ms <= 260:
+			color, bg, lit = uiAmber, uiAmberBg, 3
+		case ms <= 400:
+			color, bg, lit = uiRed, uiRedBg, 2
+		default:
+			color, bg, lit = uiRed, uiRedBg, 1
+		}
+		msText := lipgloss.NewStyle().Bold(true).Foreground(color).Render(formatLatencyMs(rtt))
+		methodPill := lipgloss.NewStyle().Foreground(color).Background(bg).Render(" " + st.Result.Method + " ")
+		leftPart = "   " + msText + " " + methodPill
+		glyphs := []rune("▁▂▃▄▅▆")
+		activeSt := lipgloss.NewStyle().Foreground(color)
+		bars = activeSt.Render(string(glyphs[:lit])) + dimBarSt.Render(string(glyphs[lit:]))
+	}
+
+	leftW := lipgloss.Width(leftPart)
+	barsW := lipgloss.Width(bars)
+	if leftW+2+barsW <= rightW {
+		return leftPart + strings.Repeat(" ", rightW-leftW-barsW-1) + bars + " "
+	}
+	return leftPart
+}
+
+func (m model) renderNotesHeader(rightW int) string {
+	if m.editingNotes {
+		icon := lipgloss.NewStyle().Foreground(uiCyan).Bold(true).Render(" ✎ ")
+		lbl := lipgloss.NewStyle().Foreground(uiCyan).Bold(true).Render(runewidth.Truncate("备注 · 编辑中", max(1, rightW-3), "…"))
+		return icon + lbl
+	}
+	icon := lipgloss.NewStyle().Foreground(uiPurple).Render(" ✎ ")
+	lbl := lipgloss.NewStyle().Foreground(uiSubText).Render(runewidth.Truncate("备注 (Notes)", max(1, rightW-3), "…"))
+	head := icon + lbl
+	hint := "Ctrl+E 编辑"
+	if lipgloss.Width(head)+2+runewidth.StringWidth(hint) <= rightW {
+		gap := rightW - lipgloss.Width(head) - runewidth.StringWidth(hint)
+		head += strings.Repeat(" ", gap) + lipgloss.NewStyle().Foreground(uiDim).Render(hint)
+	}
+	return head
+}
+
+func (m model) renderNotesCard(s ServerConfig, rightW, innerH int) []string {
+	innerW := max(1, rightW-4)
+	if m.editingNotes {
+		textSt := lipgloss.NewStyle().Foreground(uiText)
+		curSt := lipgloss.NewStyle().Foreground(lipgloss.Color("#0f172a")).Background(uiCyan).Bold(true)
+		edLines := renderNoteEditorLines(m.noteBuf, m.notePos, innerW, innerH, textSt, curSt)
+		for len(edLines) < innerH {
+			edLines = append(edLines, "")
+		}
+		return renderRoundedBox(edLines, rightW, uiCyan)
+	}
+
+	borderCol := uiBorderDim
+	content := make([]string, 0, innerH)
+	if strings.TrimSpace(s.Notes) == "" {
+		hint := runewidth.Truncate("按 Ctrl+E 或 F4 添加备注...", innerW, "…")
+		content = append(content, lipgloss.NewStyle().Foreground(uiDim).Italic(true).Render(hint))
+	} else {
+		borderCol = uiNoteBorder
+		wrapped := wrapNoteLines(s.Notes, innerW)
+		noteSt := lipgloss.NewStyle().Foreground(uiSubText)
+		for i := 0; i < min(innerH, len(wrapped)); i++ {
+			line := wrapped[i]
+			if i == innerH-1 && len(wrapped) > innerH {
+				line = runewidth.Truncate(line, max(1, innerW-1), "") + "…"
+			}
+			content = append(content, noteSt.Render(line))
+		}
+	}
+	for len(content) < innerH {
+		content = append(content, "")
+	}
+	return renderRoundedBox(content, rightW, borderCol)
+}
+
+func (m model) renderFooterLine(maxW int) string {
+	if m.status != "" {
+		clean := strings.Join(strings.Fields(sanitizeFilter(m.status)), " ")
+		shown := runewidth.Truncate(" "+clean, maxW, "…")
+		col := uiCyan
+		if strings.Contains(clean, "失败") || strings.Contains(clean, "请先") {
+			col = uiAmber
+		}
+		return lipgloss.NewStyle().Foreground(col).Render(shown)
+	}
+	if m.editingNotes {
+		plain := runewidth.Truncate(" Ctrl+S / F4 保存  ·  Enter 换行  ·  Esc 取消", maxW, "…")
+		return lipgloss.NewStyle().Foreground(uiCyan).Render(plain)
+	}
+	plain := fmt.Sprintf(" ↑↓ 选择   Enter 连接   Ctrl+E 备注   Esc 返回   (%d/%d)", len(m.filtered), len(m.config.Servers))
+	if runewidth.StringWidth(plain) > maxW {
+		plain = runewidth.Truncate(m.footer(), maxW, "…")
+	}
+	return lipgloss.NewStyle().Foreground(uiDim).Render(plain)
 }
 
 func formatEndpoint(user, host string, port int) string {
@@ -706,9 +1478,20 @@ func truncateLeft(s string, maxWidth int) string {
 	return "…" + tail
 }
 
-// Use compact columns when the detailed list would hide servers.
+// Use compact columns when the terminal is too narrow or short for the split layout.
 func (m model) compactView() string {
 	fit := func(s string) string { return runewidth.Truncate(s, m.width, "…") }
+	if m.editingNotes && len(m.filtered) > 0 && m.cursor < len(m.filtered) {
+		lines := []string{fit("✎ 备注编辑: " + inventoryName(m.filtered[m.cursor]))}
+		edH := max(1, m.height-2)
+		textSt := lipgloss.NewStyle().Foreground(uiText)
+		curSt := lipgloss.NewStyle().Foreground(lipgloss.Color("#0f172a")).Background(uiCyan)
+		edLines := renderNoteEditorLines(m.noteBuf, m.notePos, max(1, m.width), edH, textSt, curSt)
+		lines = append(lines, edLines...)
+		lines = append(lines, fit(m.footer()))
+		return strings.Join(lines, "\n")
+	}
+
 	title := "SSH · F2 归档/恢复 F3 显示归档"
 	if m.showArchived {
 		title = "SSH · F2 归档/恢复 F3 隐藏归档"
@@ -735,9 +1518,9 @@ func (m model) compactView() string {
 			addressWidth := min(runewidth.StringWidth(address), (columnWidth-3)*2/3)
 			nameWidth := columnWidth - addressWidth - 3
 			cell := "  " + fitColumn(s.Name, nameWidth) + " " + fitColumn(address, addressWidth)
-			color := lipgloss.Color("#38bdf8")
+			color := uiCyan
 			if s.Archived {
-				color = lipgloss.Color("#64748b")
+				color = uiDim
 			}
 			if i == m.cursor {
 				cell = "❯ " + strings.TrimPrefix(cell, "  ")
@@ -760,7 +1543,10 @@ func (m model) footer() string {
 	if m.status != "" {
 		return strings.Join(strings.Fields(sanitizeFilter(m.status)), " ")
 	}
-	return fmt.Sprintf("↑↓←→ 选择 Enter 连接 Esc 返回 (%d/%d)", len(m.filtered), len(m.config.Servers))
+	if m.editingNotes {
+		return "Ctrl+S/F4 保存 Enter 换行 Esc 取消"
+	}
+	return fmt.Sprintf("↑↓←→ 选择 Enter 连接 Ctrl+E 备注 Esc 返回 (%d/%d)", len(m.filtered), len(m.config.Servers))
 }
 
 // OpenSSH uses the first value, so explicit options must precede defaults.

@@ -689,11 +689,13 @@ func TestPickerShowsAllServersWhenTheyFit(t *testing.T) {
 	for _, tc := range []struct {
 		count, width, height int
 	}{
-		{24, 80, 24},
-		{30, 80, 24},
-		{42, 80, 24},
-		{50, 120, 24},
+		{16, 80, 24},
+		{24, 76, 24},
+		{30, 76, 24},
+		{42, 76, 24},
+		{36, 120, 15},
 		{30, 80, 45},
+		{30, 120, 45},
 		{30, 40, 40},
 	} {
 		t.Run(fmt.Sprintf("%d_servers_%dx%d", tc.count, tc.width, tc.height), func(t *testing.T) {
@@ -725,7 +727,7 @@ func TestPickerColumnNavigationAndResize(t *testing.T) {
 	for i := range 50 {
 		cfg.Servers = append(cfg.Servers, ServerConfig{Name: fmt.Sprintf("node-%02d", i), Host: "192.0.2.1", User: "root", Port: 22})
 	}
-	next, _ := initialModel(cfg, "").Update(tea.WindowSizeMsg{Width: 120, Height: 24})
+	next, _ := initialModel(cfg, "").Update(tea.WindowSizeMsg{Width: 76, Height: 24})
 	m := next.(model)
 	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRight})
 	m = next.(model)
