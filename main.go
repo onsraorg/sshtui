@@ -1139,6 +1139,8 @@ func answerAskpass() error {
 	return nil
 }
 
+const loginClearCommand = `LocalCommand=printf '\033[H\033[2J\033[3J'`
+
 func connectToServer(s *ServerConfig, cfg *Config) error {
 	sshPath, err := exec.LookPath("ssh")
 	if err != nil {
@@ -1149,6 +1151,9 @@ func connectToServer(s *ServerConfig, cfg *Config) error {
 		args = append(args, "-i", expandPath(s.Key))
 	}
 	args = append(args, sshOptions(s, cfg)...)
+	if term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd())) && os.Getenv("TERM") != "dumb" {
+		args = append(args, "-o", "PermitLocalCommand=yes", "-o", loginClearCommand)
+	}
 	args = append(args, "--", fmt.Sprintf("%s@%s", s.User, s.Host))
 	env := make([]string, 0, len(os.Environ())+2)
 	for _, e := range os.Environ() {

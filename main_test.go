@@ -134,6 +134,14 @@ func TestMain(m *testing.M) {
 						writeTestRecord(".password", strings.TrimSuffix(password, "\n"))
 					}
 				}
+				if slices.Contains(os.Args, loginClearCommand) {
+					localCmd := exec.Command("/bin/sh", "-c", strings.TrimPrefix(loginClearCommand, "LocalCommand="))
+					localCmd.Stdout = os.Stdout
+					localCmd.Stderr = os.Stderr
+					if err := localCmd.Run(); err != nil {
+						panic(err)
+					}
+				}
 				fmt.Print("\r\nREADY\r\n")
 				for {
 					command, err := reader.ReadString('\r')
@@ -864,6 +872,9 @@ func TestSSHInvocation(t *testing.T) {
 					t.Errorf("SSH invocation missing %s: %q", option, args)
 				}
 			}
+			if slices.Contains(args, "PermitLocalCommand=yes") || slices.Contains(args, loginClearCommand) {
+				t.Errorf("non-TTY SSH invocation should not enable LocalCommand clear: %q", args)
+			}
 		})
 	}
 }
@@ -910,6 +921,9 @@ exit [lindex $result 3]
 			}
 			if !strings.Contains(string(out), "\r\x1b[2K") {
 				t.Fatalf("connection animation was not cleared: %q", out)
+			}
+			if strings.Contains(string(out), "\x1b[2J") || strings.Contains(string(out), "\x1b[3J") {
+				t.Fatalf("failed/cancelled connection must not clear terminal history: %q", out)
 			}
 		})
 	}
@@ -1173,8 +1187,17 @@ exit [lindex $result 3]
 			if _, err := os.Stat(marker); !os.IsNotExist(err) {
 				t.Fatal("password executed Tcl code")
 			}
-			if args := readRecord[[]string](t, log+".args"); !strings.Contains(strings.Join(args, "|"), "-J|jump with spaces") {
+			args := readRecord[[]string](t, log+".args")
+			if !strings.Contains(strings.Join(args, "|"), "-J|jump with spaces") {
 				t.Fatalf("SSH arguments were split or lost: %q", args)
+			}
+			if !slices.Contains(args, "PermitLocalCommand=yes") || !slices.Contains(args, loginClearCommand) {
+				t.Fatalf("interactive SSH missing login clear LocalCommand: %q", args)
+			}
+			clearIdx := strings.Index(string(out), "\x1b[H\x1b[2J\x1b[3J")
+			readyIdx := strings.Index(string(out), "READY")
+			if clearIdx < 0 || clearIdx > readyIdx {
+				t.Fatalf("expected screen+scrollback clear before READY: clear=%d ready=%d out=%q", clearIdx, readyIdx, out)
 			}
 			if tc.ghostty {
 				set := readRecord[[]string](t, log+".title-set")

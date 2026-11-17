@@ -185,7 +185,7 @@ IPQoS=none
 args: ["-o", "ConnectTimeout=30"]
 ```
 
-连接时 `TERM` 会设置为 `xterm-256color`，避免远端缺少 `xterm-ghostty` terminfo 时出现提示符或光标错位。
+连接时 `TERM` 会设置为 `xterm-256color`，避免远端缺少 `xterm-ghostty` terminfo 时出现提示符或光标错位。交互式终端成功登录远端主机后，会通过 OpenSSH `LocalCommand` 自动清空本地当前屏幕与回滚历史（`\033[H\033[2J\033[3J`），保持远端会话从零开始；连接失败或取消时不会清屏。如需为特定服务器保留登录前的本地回滚内容，可在该服务器的 `args` 中覆盖 `["-o", "PermitLocalCommand=no"]`。
 
 ## 密码认证
 
