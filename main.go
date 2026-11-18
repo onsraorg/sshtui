@@ -49,6 +49,7 @@ type ServerConfig struct {
 	Key         string   `yaml:"key"`
 	Password    string   `yaml:"password"`
 	Args        []string `yaml:"args"` // Additional SSH arguments.
+	System      string   `yaml:"system,omitempty"`
 	Notes       string   `yaml:"notes,omitempty"`
 	Archived    bool     `yaml:"archived,omitempty"`
 	sourceIndex int
@@ -324,13 +325,13 @@ func decodeConfig(raw []byte) (*Config, error) {
 		if s.Auth != "key" && s.Auth != "password" {
 			return nil, fmt.Errorf("服务器 %q 的 auth 必须是 key 或 password", s.Name)
 		}
-		fields := append([]string{s.Name, s.Group, s.Host, s.User, s.Key}, s.Args...)
+		fields := append([]string{s.Name, s.Group, s.Host, s.User, s.Key, s.System}, s.Args...)
 		for _, field := range fields {
 			if strings.ContainsRune(field, 0) {
 				return nil, fmt.Errorf("服务器 %q 的配置不能包含 NUL 字符", s.Name)
 			}
 		}
-		for _, field := range []string{s.Name, s.Group, s.Host, s.User} {
+		for _, field := range []string{s.Name, s.Group, s.Host, s.User, s.System} {
 			if strings.IndexFunc(field, unicode.IsControl) >= 0 {
 				return nil, fmt.Errorf("服务器 %q 的显示字段不能包含控制字符", s.Name)
 			}
@@ -368,6 +369,13 @@ type latencyResultMsg struct {
 	result latencyResult
 }
 
+type systemInfoResultMsg struct {
+	key    string
+	target ServerConfig
+	info   string
+	err    error
+}
+
 type model struct {
 	config       *Config
 	filter       string
@@ -382,8 +390,10 @@ type model struct {
 	showArchived bool
 	status       string
 	latency      map[string]latencyState
+	systemProbes map[string]systemProbeState
 	probeSeq     int
 	probeFn      func(context.Context, string, int) latencyResult
+	sysProbeFn   func(context.Context, ServerConfig, *Config) (string, error)
 	editingNotes bool
 	noteBuf      []rune
 	notePos      int
@@ -403,12 +413,13 @@ func sanitizeFilter(s string) string {
 
 func initialModel(cfg *Config, initialFilter string) model {
 	m := model{
-		config:      cfg,
-		filter:      sanitizeFilter(initialFilter),
-		viewportTop: 0,
-		height:      24,
-		width:       80,
-		latency:     make(map[string]latencyState),
+		config:       cfg,
+		filter:       sanitizeFilter(initialFilter),
+		viewportTop:  0,
+		height:       24,
+		width:        80,
+		latency:      make(map[string]latencyState),
+		systemProbes: make(map[string]systemProbeState),
 	}
 	m.applyFilter()
 	return m
@@ -428,7 +439,7 @@ func (m *model) applyFilter() {
 		if s.Archived && !m.showArchived {
 			continue
 		}
-		target := strings.ToLower(fmt.Sprintf("%s %s %s %s %s", s.Name, s.Group, s.Host, s.User, s.Notes))
+		target := strings.ToLower(fmt.Sprintf("%s %s %s %s %s %s", s.Name, s.Group, s.Host, s.User, s.System, s.Notes))
 		if strings.Contains(target, lowerFilter) {
 			m.filtered = append(m.filtered, s)
 		}
@@ -646,6 +657,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case systemInfoResultMsg:
+		if m.systemProbes == nil {
+			m.systemProbes = make(map[string]systemProbeState)
+		}
+		if msg.err != nil {
+			m.systemProbes[msg.key] = systemProbeState{Err: msg.err.Error()}
+			m.status = strings.Join(strings.Fields(sanitizeFilter("系统信息采集失败: "+msg.err.Error())), " ")
+			return m, nil
+		}
+		cfg, err := saveServerSystem(msg.target, msg.info)
+		if err != nil {
+			m.systemProbes[msg.key] = systemProbeState{Err: err.Error()}
+			m.status = strings.Join(strings.Fields(sanitizeFilter("保存系统信息失败: "+err.Error())), " ")
+			return m, nil
+		}
+		delete(m.systemProbes, msg.key)
+		curIdx := -1
+		if len(m.filtered) > 0 && m.cursor < len(m.filtered) {
+			curIdx = m.filtered[m.cursor].sourceIndex
+		}
+		m.config = cfg
+		m.applyFilter()
+		if curIdx >= 0 {
+			m.selectBySourceIndex(curIdx)
+		}
+		m.status = "系统信息已更新: " + msg.info
+		return m, nil
+
 	case tea.KeyMsg:
 		if m.editingNotes {
 			return m.updateNoteEditor(msg)
@@ -698,6 +737,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				delete(m.latency, serverProbeKey(s))
 			}
 			return m, m.scheduleProbe(false)
+
+		case tea.KeyF6, tea.KeyCtrlO:
+			if len(m.filtered) == 0 {
+				return m, nil
+			}
+			s := m.filtered[m.cursor]
+			if s.Archived {
+				m.status = "已归档，请先按 F2 恢复"
+				return m, nil
+			}
+			if m.systemProbes == nil {
+				m.systemProbes = make(map[string]systemProbeState)
+			}
+			key := serverProbeKey(s)
+			if m.systemProbes[key].Probing {
+				return m, nil
+			}
+			m.systemProbes[key] = systemProbeState{Probing: true}
+			fn := m.sysProbeFn
+			if fn == nil {
+				fn = fetchServerSystemInfo
+			}
+			cfgCopy := m.config
+			return m, func() tea.Msg {
+				info, err := fn(context.Background(), s, cfgCopy)
+				return systemInfoResultMsg{key: key, target: s, info: info, err: err}
+			}
 
 		case tea.KeyCtrlC:
 			m.quitting = true
@@ -1212,7 +1278,7 @@ func (m model) renderRightPane(rightW, bodyH int) []string {
 
 	s := m.filtered[m.cursor]
 	divLine := lipgloss.NewStyle().Foreground(uiDivider).Render(strings.Repeat("─", rightW))
-	spacious := bodyH >= 25
+	spacious := bodyH >= 26
 
 	// 1. Server Title Header
 	iconBadge := lipgloss.NewStyle().Foreground(uiPurpleSoft).Background(uiPurpleBg).Bold(true).Render(" ⊡ ")
@@ -1226,7 +1292,7 @@ func (m model) renderRightPane(rightW, bodyH int) []string {
 		lines = append(lines, "")
 	}
 
-	// 2. Detail fields: Host, Username, Auth, Group
+	// 2. Detail fields: Host, Username, Auth, Group, OS
 	lblSt := lipgloss.NewStyle().Foreground(uiDim)
 	valSt := lipgloss.NewStyle().Foreground(uiText)
 	subValSt := lipgloss.NewStyle().Foreground(uiSubText)
@@ -1248,7 +1314,8 @@ func (m model) renderRightPane(rightW, bodyH int) []string {
 
 	grpText := runewidth.Truncate(s.Group, max(1, valMax-2), "…")
 	grpPill := lipgloss.NewStyle().Foreground(uiPurpleSoft).Background(uiPurpleBg).Render(" " + grpText + " ")
-	lines = append(lines, lblSt.Render(" ⌗ Group ")+grpPill)
+	lines = append(lines, lblSt.Render(" # Group ")+grpPill)
+	lines = append(lines, m.renderSystemLine(s, rightW))
 
 	// 3. Latency Section
 	if spacious {
@@ -1284,6 +1351,45 @@ func (m model) renderRightPane(rightW, bodyH int) []string {
 		lines = append(lines, m.renderNotesCard(s, rightW, noteInnerH)...)
 	}
 	return lines
+}
+
+func (m model) renderSystemLine(s ServerConfig, rightW int) string {
+	lbl := lipgloss.NewStyle().Foreground(uiDim).Render(" ⊞ OS    ")
+	valMax := max(1, rightW-9)
+	sysSt := m.systemProbes[serverProbeKey(s)]
+
+	if sysSt.Probing {
+		return lbl + lipgloss.NewStyle().Foreground(uiCyan).Render(runewidth.Truncate("采集中...", valMax, "…"))
+	}
+	if strings.TrimSpace(s.System) != "" {
+		osPart, archPart, hasSep := strings.Cut(s.System, " · ")
+		if hasSep && archPart != "" {
+			archPlain := " " + archPart + " "
+			archW := runewidth.StringWidth(archPlain)
+			if archW+2 <= valMax {
+				archFg, archBg := uiCyan, lipgloss.Color("#0c3142")
+				if strings.HasPrefix(strings.ToUpper(archPart), "ARM") {
+					archFg, archBg = uiGreen, uiGreenBg
+				}
+				osShown := runewidth.Truncate(osPart, max(1, valMax-archW-1), "…")
+				osStyled := lipgloss.NewStyle().Foreground(uiText).Render(osShown)
+				archPill := lipgloss.NewStyle().Foreground(archFg).Background(archBg).Bold(true).Render(archPlain)
+				return lbl + osStyled + " " + archPill
+			}
+		}
+		return lbl + lipgloss.NewStyle().Foreground(uiText).Render(runewidth.Truncate(s.System, valMax, "…"))
+	}
+	if s.Archived {
+		return lbl + lipgloss.NewStyle().Foreground(uiDim).Render(runewidth.Truncate("已归档", valMax, "…"))
+	}
+	if sysSt.Err != "" {
+		return lbl + lipgloss.NewStyle().Foreground(uiAmber).Render(runewidth.Truncate("采集失败 · Ctrl+O 重试", valMax, "…"))
+	}
+	hint := "待采集 · Ctrl+O"
+	if valMax >= 24 {
+		hint = "待采集 (连接或 Ctrl+O)"
+	}
+	return lbl + lipgloss.NewStyle().Foreground(uiDim).Render(runewidth.Truncate(hint, valMax, "…"))
 }
 
 func (m model) renderLatencyLine(s ServerConfig, rightW int) string {
@@ -1404,7 +1510,10 @@ func (m model) renderFooterLine(maxW int) string {
 		plain := runewidth.Truncate(" Ctrl+S / F4 保存  ·  Enter 换行  ·  Esc 取消", maxW, "…")
 		return lipgloss.NewStyle().Foreground(uiCyan).Render(plain)
 	}
-	plain := fmt.Sprintf(" ↑↓ 选择   Enter 连接   Ctrl+E 备注   Esc 返回   (%d/%d)", len(m.filtered), len(m.config.Servers))
+	plain := fmt.Sprintf(" ↑↓ 选择   Enter 连接   Ctrl+E 备注   Ctrl+O 系统   Esc 返回   (%d/%d)", len(m.filtered), len(m.config.Servers))
+	if runewidth.StringWidth(plain) > maxW {
+		plain = fmt.Sprintf(" ↑↓ 选择  Enter 连接  Ctrl+E 备注  Esc 返回  (%d/%d)", len(m.filtered), len(m.config.Servers))
+	}
 	if runewidth.StringWidth(plain) > maxW {
 		plain = runewidth.Truncate(m.footer(), maxW, "…")
 	}
@@ -1939,6 +2048,11 @@ func connectToServer(s *ServerConfig, cfg *Config) error {
 	args = append(args, sshOptions(s, cfg)...)
 	if term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd())) && os.Getenv("TERM") != "dumb" {
 		args = append(args, "-o", "PermitLocalCommand=yes", "-o", loginClearCommand)
+	}
+	muxArgs, stopMux := startMuxSystemCollector(s, sshPath)
+	if stopMux != nil {
+		defer stopMux()
+		args = append(args, muxArgs...)
 	}
 	args = append(args, "--", fmt.Sprintf("%s@%s", s.User, s.Host))
 	env := make([]string, 0, len(os.Environ())+2)

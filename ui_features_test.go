@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -382,6 +383,133 @@ func TestNotesEditorBoundsAcrossWindowSizes(t *testing.T) {
 		view := m.View()
 		if lipgloss.Width(view) > size.Width || lipgloss.Height(view) > size.Height {
 			t.Fatalf("editor view %dx%d overflowed %dx%d", lipgloss.Width(view), lipgloss.Height(view), size.Width, size.Height)
+		}
+	}
+}
+
+func TestParseRemoteSystemInfo(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{"Linux aarch64\nubuntu\n24.04\nUbuntu 24.04.1 LTS\n", "Ubuntu 24.04 · ARM64"},
+		{"Linux x86_64\nubuntu\n22.04\nUbuntu 22.04.4 LTS\n", "Ubuntu 22.04 · AMD64"},
+		{"Linux x86_64\ndebian\n12\nDebian GNU/Linux 12 (bookworm)\n", "Debian 12 · AMD64"},
+		{"Linux aarch64\nalpine\n3.20.3\nAlpine Linux v3.20\n", "Alpine 3.20 · ARM64"},
+		{"Linux aarch64\nol\n9.4\nOracle Linux Server 9.4\n", "Oracle Linux 9.4 · ARM64"},
+		{"Linux x86_64\narch\n\nArch Linux\n", "Arch Linux · AMD64"},
+		{"Darwin arm64\nmacos\n15.1\n\n", "macOS 15.1 · ARM64"},
+		{"Linux x86_64\n\n\nCustomOS\x1b[31m 1.0 (codename)\n", "CustomOS[31m 1.0 · AMD64"},
+	}
+	for _, tc := range cases {
+		if got := parseRemoteSystemInfo(tc.raw); got != tc.want {
+			t.Errorf("parseRemoteSystemInfo(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
+func TestSystemInfoTUIProbePersistenceAndFilter(t *testing.T) {
+	raw := "# keep header\nservers:\n  - name: arm-box\n    host: 192.0.2.10\n    password: keep-secret\n  - name: amd-box\n    host: 192.0.2.20\n    system: \"Debian 12 · AMD64\"\n"
+	home, path := configFixture(t, raw)
+	t.Setenv("HOME", home)
+
+	cfg, _, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, _ := initialModel(cfg, "").Update(tea.WindowSizeMsg{Width: 108, Height: 26})
+	m := next.(model)
+
+	// amd-box comes first alphabetically ("amd-box" < "arm-box") and shows pre-saved OS + Arch.
+	if !strings.Contains(m.View(), "Debian 12") || !strings.Contains(m.View(), "AMD64") {
+		t.Fatalf("saved system field not rendered: %s", m.View())
+	}
+
+	// Select arm-box (uncollected) -> shows placeholder, then press Ctrl+O to probe asynchronously.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = next.(model)
+	if !strings.Contains(m.View(), "待采集") {
+		t.Fatalf("expected uncollected placeholder on arm-box: %s", m.View())
+	}
+
+	m.sysProbeFn = func(_ context.Context, s ServerConfig, _ *Config) (string, error) {
+		return "Ubuntu 24.04 · ARM64", nil
+	}
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+	m = next.(model)
+	if cmd == nil || !strings.Contains(m.View(), "采集中...") {
+		t.Fatalf("Ctrl+O did not start non-blocking system probe: %s", m.View())
+	}
+
+	// Simulate user editing notes BEFORE async system probe finishes: saveServerSystem must not clobber notes!
+	targetBefore := m.filtered[m.cursor]
+	cfgWithNote, err := setServerNotes(targetBefore, "保留此备注")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.config = cfgWithNote
+	m.applyFilter()
+
+	resMsg := cmd()
+	next, _ = m.Update(resMsg)
+	m = next.(model)
+
+	view := m.View()
+	if !strings.Contains(view, "Ubuntu 24.04") || !strings.Contains(view, "ARM64") {
+		t.Fatalf("probed system info missing from view: %s", view)
+	}
+
+	// Verify disk persistence, preserved notes, comments, and permissions.
+	reloaded, _, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	armSrv := directMatch(reloaded.Servers, "arm-box")
+	if armSrv == nil || armSrv.System != "Ubuntu 24.04 · ARM64" || armSrv.Notes != "保留此备注" || armSrv.Password != "keep-secret" {
+		t.Fatalf("persisted server mismatch: %+v", armSrv)
+	}
+	diskBytes, _ := os.ReadFile(path)
+	if !strings.Contains(string(diskBytes), "# keep header") {
+		t.Fatalf("comment lost after system save: %s", diskBytes)
+	}
+
+	// Verify filtering by OS / architecture keyword.
+	for _, r := range "arm64" {
+		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = next.(model)
+	}
+	if len(m.filtered) != 1 || m.filtered[0].Name != "arm-box" {
+		t.Fatalf("system/arch filter failed: %+v", m.filtered)
+	}
+}
+
+func TestFetchServerSystemInfoKeyAndAskpass(t *testing.T) {
+	bin := t.TempDir()
+	fakeSSH := filepath.Join(bin, "ssh")
+	script := `#!/bin/sh
+if [ "$SSH_ASKPASS_REQUIRE" = "force" ]; then
+	pw=$("$SSH_ASKPASS" "root@host's password:") || exit 21
+	[ "$pw" = "probe-pass-123" ] || exit 22
+fi
+printf 'Linux aarch64\nubuntu\n24.04\nUbuntu 24.04.1 LTS\n'
+`
+	if err := os.WriteFile(fakeSSH, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("SSHTUI_TEST_PROCESS", "1")
+
+	cfg := &Config{}
+	cfg.Default.ServerAliveInterval = 15
+	cfg.Default.ServerAliveCountMax = 30
+
+	for _, s := range []ServerConfig{
+		{Name: "key-node", Host: "192.0.2.1", Port: 22, User: "root", Auth: "key"},
+		{Name: "pass-node", Host: "192.0.2.2", Port: 22, User: "root", Auth: "password", Password: "probe-pass-123"},
+	} {
+		got, err := fetchServerSystemInfo(context.Background(), s, cfg)
+		if err != nil || got != "Ubuntu 24.04 · ARM64" {
+			t.Fatalf("fetchServerSystemInfo(%s): got %q, err=%v", s.Auth, got, err)
 		}
 	}
 }
