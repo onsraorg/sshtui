@@ -50,6 +50,7 @@ type ServerConfig struct {
 	Password    string   `yaml:"password"`
 	Args        []string `yaml:"args"` // Additional SSH arguments.
 	System      string   `yaml:"system,omitempty"`
+	Spec        string   `yaml:"spec,omitempty"`
 	Notes       string   `yaml:"notes,omitempty"`
 	Archived    bool     `yaml:"archived,omitempty"`
 	sourceIndex int
@@ -325,13 +326,13 @@ func decodeConfig(raw []byte) (*Config, error) {
 		if s.Auth != "key" && s.Auth != "password" {
 			return nil, fmt.Errorf("服务器 %q 的 auth 必须是 key 或 password", s.Name)
 		}
-		fields := append([]string{s.Name, s.Group, s.Host, s.User, s.Key, s.System}, s.Args...)
+		fields := append([]string{s.Name, s.Group, s.Host, s.User, s.Key, s.System, s.Spec}, s.Args...)
 		for _, field := range fields {
 			if strings.ContainsRune(field, 0) {
 				return nil, fmt.Errorf("服务器 %q 的配置不能包含 NUL 字符", s.Name)
 			}
 		}
-		for _, field := range []string{s.Name, s.Group, s.Host, s.User, s.System} {
+		for _, field := range []string{s.Name, s.Group, s.Host, s.User, s.System, s.Spec} {
 			if strings.IndexFunc(field, unicode.IsControl) >= 0 {
 				return nil, fmt.Errorf("服务器 %q 的显示字段不能包含控制字符", s.Name)
 			}
@@ -370,10 +371,10 @@ type latencyResultMsg struct {
 }
 
 type systemInfoResultMsg struct {
-	key    string
-	target ServerConfig
-	info   string
-	err    error
+	key     string
+	target  ServerConfig
+	profile serverProfile
+	err     error
 }
 
 type model struct {
@@ -393,7 +394,7 @@ type model struct {
 	systemProbes map[string]systemProbeState
 	probeSeq     int
 	probeFn      func(context.Context, string, int) latencyResult
-	sysProbeFn   func(context.Context, ServerConfig, *Config) (string, error)
+	sysProbeFn   func(context.Context, ServerConfig, *Config) (serverProfile, error)
 	editingNotes bool
 	noteBuf      []rune
 	notePos      int
@@ -439,7 +440,7 @@ func (m *model) applyFilter() {
 		if s.Archived && !m.showArchived {
 			continue
 		}
-		target := strings.ToLower(fmt.Sprintf("%s %s %s %s %s %s", s.Name, s.Group, s.Host, s.User, s.System, s.Notes))
+		target := strings.ToLower(fmt.Sprintf("%s %s %s %s %s %s %s", s.Name, s.Group, s.Host, s.User, s.System, s.Spec, s.Notes))
 		if strings.Contains(target, lowerFilter) {
 			m.filtered = append(m.filtered, s)
 		}
@@ -666,7 +667,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = strings.Join(strings.Fields(sanitizeFilter("系统信息采集失败: "+msg.err.Error())), " ")
 			return m, nil
 		}
-		cfg, err := saveServerSystem(msg.target, msg.info)
+		cfg, err := saveServerProfile(msg.target, msg.profile)
 		if err != nil {
 			m.systemProbes[msg.key] = systemProbeState{Err: err.Error()}
 			m.status = strings.Join(strings.Fields(sanitizeFilter("保存系统信息失败: "+err.Error())), " ")
@@ -682,7 +683,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if curIdx >= 0 {
 			m.selectBySourceIndex(curIdx)
 		}
-		m.status = "系统信息已更新: " + msg.info
+		summary := cmp.Or(msg.profile.System, msg.profile.Spec)
+		if msg.profile.System != "" && msg.profile.Spec != "" {
+			summary = msg.profile.System + " / " + msg.profile.Spec
+		}
+		m.status = "已更新: " + summary
 		return m, nil
 
 	case tea.KeyMsg:
@@ -757,12 +762,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.systemProbes[key] = systemProbeState{Probing: true}
 			fn := m.sysProbeFn
 			if fn == nil {
-				fn = fetchServerSystemInfo
+				fn = fetchServerProfile
 			}
 			cfgCopy := m.config
 			return m, func() tea.Msg {
-				info, err := fn(context.Background(), s, cfgCopy)
-				return systemInfoResultMsg{key: key, target: s, info: info, err: err}
+				profile, err := fn(context.Background(), s, cfgCopy)
+				return systemInfoResultMsg{key: key, target: s, profile: profile, err: err}
 			}
 
 		case tea.KeyCtrlC:
@@ -1278,7 +1283,7 @@ func (m model) renderRightPane(rightW, bodyH int) []string {
 
 	s := m.filtered[m.cursor]
 	divLine := lipgloss.NewStyle().Foreground(uiDivider).Render(strings.Repeat("─", rightW))
-	spacious := bodyH >= 26
+	spacious := bodyH >= 27
 
 	// 1. Server Title Header
 	iconBadge := lipgloss.NewStyle().Foreground(uiPurpleSoft).Background(uiPurpleBg).Bold(true).Render(" ⊡ ")
@@ -1288,11 +1293,11 @@ func (m model) renderRightPane(rightW, bodyH int) []string {
 		nameStyle = nameStyle.Foreground(uiDim)
 	}
 	lines = append(lines, iconBadge+" "+nameStyle.Render(titleName))
-	if bodyH >= 19 {
+	if bodyH >= 20 {
 		lines = append(lines, "")
 	}
 
-	// 2. Detail fields: Host, Username, Auth, Group, OS
+	// 2. Detail fields: Host, Username, Auth, Group, OS, Spec
 	lblSt := lipgloss.NewStyle().Foreground(uiDim)
 	valSt := lipgloss.NewStyle().Foreground(uiText)
 	subValSt := lipgloss.NewStyle().Foreground(uiSubText)
@@ -1316,6 +1321,7 @@ func (m model) renderRightPane(rightW, bodyH int) []string {
 	grpPill := lipgloss.NewStyle().Foreground(uiPurpleSoft).Background(uiPurpleBg).Render(" " + grpText + " ")
 	lines = append(lines, lblSt.Render(" # Group ")+grpPill)
 	lines = append(lines, m.renderSystemLine(s, rightW))
+	lines = append(lines, m.renderSpecLine(s, rightW))
 
 	// 3. Latency Section
 	if spacious {
@@ -1390,6 +1396,37 @@ func (m model) renderSystemLine(s ServerConfig, rightW int) string {
 		hint = "待采集 (连接或 Ctrl+O)"
 	}
 	return lbl + lipgloss.NewStyle().Foreground(uiDim).Render(runewidth.Truncate(hint, valMax, "…"))
+}
+
+func (m model) renderSpecLine(s ServerConfig, rightW int) string {
+	lbl := lipgloss.NewStyle().Foreground(uiDim).Render(" ⊟ Spec  ")
+	valMax := max(1, rightW-9)
+	sysSt := m.systemProbes[serverProbeKey(s)]
+
+	if sysSt.Probing {
+		return lbl + lipgloss.NewStyle().Foreground(uiCyan).Render(runewidth.Truncate("采集中...", valMax, "…"))
+	}
+	if strings.TrimSpace(s.Spec) != "" {
+		shown := runewidth.Truncate(s.Spec, valMax, "…")
+		parts := strings.Split(shown, " · ")
+		if len(parts) > 1 {
+			valSt := lipgloss.NewStyle().Foreground(uiSubText)
+			sepSt := lipgloss.NewStyle().Foreground(uiDim)
+			var rendered []string
+			for _, p := range parts {
+				rendered = append(rendered, valSt.Render(p))
+			}
+			return lbl + strings.Join(rendered, sepSt.Render(" · "))
+		}
+		return lbl + lipgloss.NewStyle().Foreground(uiSubText).Render(shown)
+	}
+	if s.Archived {
+		return lbl + lipgloss.NewStyle().Foreground(uiDim).Render("—")
+	}
+	if strings.TrimSpace(s.System) != "" {
+		return lbl + lipgloss.NewStyle().Foreground(uiDim).Render(runewidth.Truncate("待采集 · Ctrl+O", valMax, "…"))
+	}
+	return lbl + lipgloss.NewStyle().Foreground(uiDim).Render("—")
 }
 
 func (m model) renderLatencyLine(s ServerConfig, rightW int) string {

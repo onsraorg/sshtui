@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -21,7 +22,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const remoteSystemProbeCmd = `sh -c 'uname -s -m; if [ -r /etc/os-release ]; then . /etc/os-release 2>/dev/null; printf "%s\n%s\n%s\n" "$ID" "$VERSION_ID" "$PRETTY_NAME"; elif command -v sw_vers >/dev/null 2>&1; then printf "macos\n%s\n\n" "$(sw_vers -productVersion 2>/dev/null)"; fi'`
+const remoteSystemProbeCmd = `sh -c 'uname -s -m; if [ -r /etc/os-release ]; then . /etc/os-release 2>/dev/null; printf "%s\n%s\n%s\n" "$ID" "$VERSION_ID" "$PRETTY_NAME"; elif command -v sw_vers >/dev/null 2>&1; then printf "macos\n%s\n\n" "$(sw_vers -productVersion 2>/dev/null)"; else printf "\n\n\n"; fi; cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || grep -c "^processor" /proc/cpuinfo 2>/dev/null); mem=""; if [ -r /proc/meminfo ]; then while read -r k v _; do case "$k" in MemTotal:) mem="K:$v"; break;; esac; done </proc/meminfo; fi; [ -n "$mem" ] || mem="B:$(sysctl -n hw.memsize 2>/dev/null || sysctl -n hw.physmem 2>/dev/null)"; disk=$(df -Pk / 2>/dev/null | { read -r _ && read -r _ d _ && printf "%s" "$d"; }); printf "SPEC\t%s\t%s\t%s\n" "$cpus" "$mem" "$disk"'`
+
+type serverProfile struct {
+	System string
+	Spec   string
+}
 
 type systemProbeState struct {
 	Probing bool
@@ -135,13 +141,97 @@ func formatDistroName(id, versionID, prettyName, kernel string) string {
 	}
 }
 
-func parseRemoteSystemInfo(raw string) string {
-	raw = strings.ReplaceAll(raw, "\r\n", "\n")
-	lines := strings.Split(strings.TrimSpace(raw), "\n")
-	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+func formatMemoryBytes(totalBytes uint64) string {
+	if totalBytes == 0 {
 		return ""
 	}
-	unameFields := strings.Fields(lines[0])
+	mib := totalBytes / (1024 * 1024)
+	if mib == 0 {
+		return ""
+	}
+	if mib < 768 {
+		if mib >= 128 {
+			mib = ((mib + 32) / 64) * 64
+		}
+		return fmt.Sprintf("%dM", mib)
+	}
+	gib := float64(totalBytes) / (1024 * 1024 * 1024)
+	ceil := math.Ceil(gib)
+	if diff := ceil - gib; diff > 0 && diff <= max(0.25, ceil*0.05) {
+		return fmt.Sprintf("%dG", max(1, int(ceil)))
+	}
+	return fmt.Sprintf("%dG", max(1, int(math.Round(gib))))
+}
+
+func formatDiskKiB(kib uint64) string {
+	if kib == 0 {
+		return ""
+	}
+	gib := float64(kib) / (1024 * 1024)
+	if gib >= 1000 {
+		tib := gib / 1024
+		if math.Abs(tib-math.Round(tib)) < 0.05 {
+			return fmt.Sprintf("%dT", max(1, int(math.Round(tib))))
+		}
+		return fmt.Sprintf("%.1fT", tib)
+	}
+	if gib >= 1 {
+		return fmt.Sprintf("%dG", max(1, int(math.Round(gib))))
+	}
+	return fmt.Sprintf("%dM", max(1, kib/1024))
+}
+
+func parseSpecLine(line string) string {
+	parts := strings.Split(strings.TrimPrefix(line, "SPEC\t"), "\t")
+	var items []string
+	if len(parts) >= 1 {
+		if cpus, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil && cpus >= 1 && cpus <= 4096 {
+			items = append(items, fmt.Sprintf("%dC", cpus))
+		}
+	}
+	if len(parts) >= 2 {
+		memToken := strings.TrimSpace(parts[1])
+		var memBytes uint64
+		if after, ok := strings.CutPrefix(memToken, "K:"); ok {
+			if kib, err := strconv.ParseUint(strings.TrimSpace(after), 10, 64); err == nil {
+				memBytes = kib * 1024
+			}
+		} else if after, ok := strings.CutPrefix(memToken, "B:"); ok {
+			if b, err := strconv.ParseUint(strings.TrimSpace(after), 10, 64); err == nil {
+				memBytes = b
+			}
+		}
+		if memStr := formatMemoryBytes(memBytes); memStr != "" {
+			items = append(items, memStr)
+		}
+	}
+	if len(parts) >= 3 {
+		if diskKiB, err := strconv.ParseUint(strings.TrimSpace(parts[2]), 10, 64); err == nil {
+			if diskStr := formatDiskKiB(diskKiB); diskStr != "" {
+				items = append(items, diskStr)
+			}
+		}
+	}
+	return sanitizeSystemField(strings.Join(items, " · "))
+}
+
+func parseRemoteServerProfile(raw string) serverProfile {
+	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+	rawLines := strings.Split(strings.TrimRight(raw, "\n"), "\n")
+	var osLines []string
+	var spec string
+	for _, line := range rawLines {
+		if strings.HasPrefix(line, "SPEC\t") {
+			spec = parseSpecLine(line)
+			continue
+		}
+		osLines = append(osLines, line)
+	}
+	if len(osLines) == 0 || strings.TrimSpace(osLines[0]) == "" {
+		return serverProfile{Spec: spec}
+	}
+
+	unameFields := strings.Fields(osLines[0])
 	var kernel, arch string
 	if len(unameFields) >= 1 {
 		kernel = unameFields[0]
@@ -150,31 +240,57 @@ func parseRemoteSystemInfo(raw string) string {
 		arch = normalizeArch(unameFields[len(unameFields)-1])
 	}
 	var id, ver, pretty string
-	if len(lines) > 1 {
-		id = lines[1]
+	if len(osLines) > 1 {
+		id = osLines[1]
 	}
-	if len(lines) > 2 {
-		ver = lines[2]
+	if len(osLines) > 2 {
+		ver = osLines[2]
 	}
-	if len(lines) > 3 {
-		pretty = lines[3]
+	if len(osLines) > 3 {
+		pretty = osLines[3]
 	}
 	osPart := sanitizeSystemField(formatDistroName(id, ver, pretty, kernel))
 	arch = sanitizeSystemField(arch)
+	var sys string
 	switch {
 	case osPart != "" && arch != "":
-		return sanitizeSystemField(osPart + " · " + arch)
+		sys = sanitizeSystemField(osPart + " · " + arch)
 	case osPart != "":
-		return osPart
+		sys = osPart
 	default:
-		return arch
+		sys = arch
 	}
+	return serverProfile{System: sys, Spec: spec}
 }
 
-func saveServerSystem(target ServerConfig, sysInfo string) (*Config, error) {
-	sysInfo = sanitizeSystemField(sysInfo)
-	if sysInfo == "" {
-		return nil, fmt.Errorf("未获取到有效系统信息")
+func parseRemoteSystemInfo(raw string) string {
+	return parseRemoteServerProfile(raw).System
+}
+
+func upsertMappingString(entry *yaml.Node, key, val string) {
+	if val == "" {
+		return
+	}
+	for i := 0; i < len(entry.Content); i += 2 {
+		if entry.Content[i].Value == key {
+			node := *entry.Content[i+1]
+			node.Kind, node.Tag, node.Value = yaml.ScalarNode, "!!str", val
+			node.Style, node.Alias, node.Content, node.Anchor = 0, nil, nil, ""
+			entry.Content[i+1] = &node
+			return
+		}
+	}
+	entry.Content = append(entry.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: val},
+	)
+}
+
+func saveServerProfile(target ServerConfig, profile serverProfile) (*Config, error) {
+	profile.System = sanitizeSystemField(profile.System)
+	profile.Spec = sanitizeSystemField(profile.Spec)
+	if profile.System == "" && profile.Spec == "" {
+		return nil, fmt.Errorf("未获取到有效服务器系统与硬件信息")
 	}
 	return editServersConfig(func(cfg *Config, servers *yaml.Node) error {
 		index := -1
@@ -207,27 +323,16 @@ func saveServerSystem(target ServerConfig, sysInfo string) (*Config, error) {
 		if entry.Kind != yaml.MappingNode {
 			return fmt.Errorf("服务器配置必须为 YAML 映射")
 		}
-		for i := 0; i < len(entry.Content); i += 2 {
-			if entry.Content[i].Value == "system" {
-				value := *entry.Content[i+1]
-				value.Kind, value.Tag, value.Value = yaml.ScalarNode, "!!str", sysInfo
-				value.Style, value.Alias, value.Content, value.Anchor = 0, nil, nil, ""
-				entry.Content[i+1] = &value
-				return nil
-			}
-		}
-		entry.Content = append(entry.Content,
-			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "system"},
-			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: sysInfo},
-		)
+		upsertMappingString(entry, "system", profile.System)
+		upsertMappingString(entry, "spec", profile.Spec)
 		return nil
 	})
 }
 
-func fetchServerSystemInfo(parent context.Context, s ServerConfig, cfg *Config) (string, error) {
+func fetchServerProfile(parent context.Context, s ServerConfig, cfg *Config) (serverProfile, error) {
 	sshPath, err := exec.LookPath("ssh")
 	if err != nil {
-		return "", fmt.Errorf("未找到 ssh 命令")
+		return serverProfile{}, fmt.Errorf("未找到 ssh 命令")
 	}
 	ctx, cancel := context.WithTimeout(parent, 12*time.Second)
 	defer cancel()
@@ -252,13 +357,13 @@ func fetchServerSystemInfo(parent context.Context, s ServerConfig, cfg *Config) 
 		out, err = cmd.Output()
 	}
 	if err != nil {
-		return "", err
+		return serverProfile{}, err
 	}
-	info := parseRemoteSystemInfo(string(out))
-	if info == "" {
-		return "", fmt.Errorf("未能解析远端系统信息")
+	profile := parseRemoteServerProfile(string(out))
+	if profile.System == "" && profile.Spec == "" {
+		return serverProfile{}, fmt.Errorf("未能解析远端系统与硬件信息")
 	}
-	return info, nil
+	return profile, nil
 }
 
 func runAskpassCapture(ctx context.Context, sshPath string, args []string, password string) ([]byte, error) {
@@ -347,7 +452,7 @@ func runAskpassCapture(ctx context.Context, sshPath string, args []string, passw
 }
 
 func startMuxSystemCollector(s *ServerConfig, sshPath string) ([]string, func()) {
-	if s == nil || s.Archived || strings.TrimSpace(s.System) != "" {
+	if s == nil || s.Archived || (strings.TrimSpace(s.System) != "" && strings.TrimSpace(s.Spec) != "") {
 		return nil, nil
 	}
 	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) || os.Getenv("TERM") == "dumb" {
@@ -395,8 +500,9 @@ func startMuxSystemCollector(s *ServerConfig, sshPath string) ([]string, func())
 				out, err := cmd.Output()
 				probeCancel()
 				if err == nil {
-					if sysInfo := parseRemoteSystemInfo(string(out)); sysInfo != "" {
-						_, _ = saveServerSystem(target, sysInfo)
+					profile := parseRemoteServerProfile(string(out))
+					if profile.System != "" || profile.Spec != "" {
+						_, _ = saveServerProfile(target, profile)
 					}
 				}
 				return
